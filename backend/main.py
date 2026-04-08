@@ -5,19 +5,22 @@ import numpy as np
 import json
 import os
 from tokenizers import Tokenizer
+from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
-# Load model and config
-BASE = os.path.dirname(os.path.abspath(__file__))
-ASSETS = os.path.join(BASE, "../assets")
+# Download model files from Hugging Face
+REPO_ID = "joaquinkriztel/phishsense-model"
+MODEL_PATH = hf_hub_download(repo_id=REPO_ID, filename="phishsense_model.onnx")
+TOKENIZER_PATH = hf_hub_download(repo_id=REPO_ID, filename="tokenizer.json")
+LABEL_MAP_PATH = hf_hub_download(repo_id=REPO_ID, filename="label_map.json")
 
-session = ort.InferenceSession(os.path.join(ASSETS, "phishsense_model.onnx"))
-tokenizer = Tokenizer.from_file(os.path.join(ASSETS, "tokenizer.json"))
+session = ort.InferenceSession(MODEL_PATH)
+tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 tokenizer.enable_truncation(max_length=128)
 tokenizer.enable_padding(length=128, pad_id=1)
 
-with open(os.path.join(ASSETS, "label_map.json")) as f:
+with open(LABEL_MAP_PATH) as f:
     label_map = json.load(f)
 
 class MessageRequest(BaseModel):
@@ -26,7 +29,6 @@ class MessageRequest(BaseModel):
 @app.post("/predict")
 def predict(req: MessageRequest):
     encoding = tokenizer.encode(req.message)
-    
     input_ids = np.array([encoding.ids], dtype=np.int64)
     attention_mask = np.array([encoding.attention_mask], dtype=np.int64)
 

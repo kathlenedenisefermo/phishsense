@@ -43,3 +43,5 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+ios/PhishSenseFilter/assets/phishsense_model.onnx
+assets/phishsense_model.onnx

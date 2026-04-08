@@ -45,3 +45,6 @@ app.*.map.json
 /android/app/release
 ios/PhishSenseFilter/assets/phishsense_model.onnx
 assets/phishsense_model.onnx
+ios/build/
+ios_backup/
+ios_safe_before_filter/

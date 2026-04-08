@@ -10,9 +10,11 @@ import 'conversation_page.dart';
 import 'compose.dart';
 import 'contacts_page.dart';
 
+
 class MessagesPage extends StatefulWidget {
   final String name;
   final int defaultSmsIndex;
+  final bool contactsPermission;
   final bool notificationPermission;
   final bool spamFolderEnabled;
   final bool shareAnonymousData;
@@ -24,6 +26,7 @@ class MessagesPage extends StatefulWidget {
     super.key,
     required this.name,
     required this.defaultSmsIndex,
+    required this.contactsPermission,
     required this.notificationPermission,
     required this.spamFolderEnabled,
     required this.shareAnonymousData,
@@ -101,11 +104,44 @@ class _MessagesPageState extends State<MessagesPage>
     _checkDefaultSmsApp();
   }
 
+
+  @override
+  void didUpdateWidget(covariant MessagesPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (!oldWidget.contactsPermission && widget.contactsPermission) {
+    _reloadContactNames();
+    }
+  }
+  
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _waitingForDefault) {
-      _waitingForDefault = false;
-      _checkDefaultSmsApp();
+    if (state == AppLifecycleState.resumed) {
+      if (_waitingForDefault) {
+        _waitingForDefault = false;
+        _checkDefaultSmsApp();
+      }
+
+      if (widget.contactsPermission) {
+        _reloadContactNames();
+      }
+    }
+ }
+ 
+   Future<void> _reloadContactNames() async {
+    if (!widget.contactsPermission) return;
+
+    final uniqueSenders = _messages.map((m) => m.sender).toSet();
+
+    for (final number in uniqueSenders) {
+      final name = await SmsService.lookupContactName(number);
+      if (name != null && name.isNotEmpty) {
+      _contactNames[number] = name;
+      }
+    }
+
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -268,10 +304,14 @@ class _MessagesPageState extends State<MessagesPage>
     final inbox = await SmsService.readInbox(limit: 500);
     if (!mounted) return;
 
-    final uniqueSenders = inbox.map((m) => m.sender).toSet();
-    for (final number in uniqueSenders) {
-      final name = await SmsService.lookupContactName(number);
-      if (name != null && name.isNotEmpty) _contactNames[number] = name;
+    if (widget.contactsPermission) {
+      final uniqueSenders = inbox.map((m) => m.sender).toSet();
+      for (final number in uniqueSenders) {
+        final name = await SmsService.lookupContactName(number);
+        if (name != null && name.isNotEmpty) {
+          _contactNames[number] = name;
+        }
+      }
     }
 
     await _loadLabelCache();
@@ -292,11 +332,15 @@ class _MessagesPageState extends State<MessagesPage>
     final counts = await SmsService.getUnreadCounts();
     if (!mounted) return;
     // Resolve new contact names
-    final newSenders = inbox.map((m) => m.sender).toSet()
-        .difference(_contactNames.keys.toSet());
-    for (final number in newSenders) {
-      final name = await SmsService.lookupContactName(number);
-      if (name != null && name.isNotEmpty) _contactNames[number] = name;
+    if (widget.contactsPermission) {
+      final newSenders = inbox.map((m) => m.sender).toSet()
+          .difference(_contactNames.keys.toSet());
+      for (final number in newSenders) {
+        final name = await SmsService.lookupContactName(number);
+        if (name != null && name.isNotEmpty) {
+          _contactNames[number] = name;
+        }
+      }
     }
     setState(() {
       // Keep stream-received messages that haven't been written to DB yet
@@ -701,10 +745,12 @@ class _MessagesPageState extends State<MessagesPage>
     });
 
     // Resolve contact name in the background and refresh display name if found.
-    final name = await SmsService.lookupContactName(msg.sender);
-    if (name != null && name.isNotEmpty && mounted) {
-      _contactNames[msg.sender] = name;
-      setState(() {});
+    if (widget.contactsPermission) {
+      final name = await SmsService.lookupContactName(msg.sender);
+      if (name != null && name.isNotEmpty && mounted) {
+        _contactNames[msg.sender] = name;
+        setState(() {});
+      }
     }
 
     final result = await PhishingDetector.classify(msgToInsert.body);
@@ -1245,7 +1291,7 @@ class _MessagesPageState extends State<MessagesPage>
                   : threads.isEmpty
                       ? const Center(
                           child: Text(
-                            "No messages yet.\nSend one or wait for incoming SMS.",
+                            "No messages yet.\nMessages classified by PhishSense will appear here.",
                             textAlign: TextAlign.center,
                             style: TextStyle(color: Color(0xFF888888), fontSize: 15),
                           ),
@@ -1350,7 +1396,10 @@ class _MessagesPageState extends State<MessagesPage>
                           },
                         ),
                   // ── Tab 1: Contacts ───────────────────────────────────
-                  const ContactsPage(embedded: true),
+                  ContactsPage(
+                    key: ValueKey(widget.contactsPermission),
+                    embedded: true,
+                  ),
                 ],
               ),
             ),

@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'permission.dart';
+import 'error.dart';
 
 class Step1Page extends StatelessWidget {
   final VoidCallback onContinue;
@@ -7,6 +9,16 @@ class Step1Page extends StatelessWidget {
     super.key,
     required this.onContinue,
   });
+
+  void _showRequiredPermissionError(BuildContext context) {
+    ErrorPage.show(
+      context,
+      title: "Permission Required",
+      message:
+          "You cannot continue unless you allow PhishSense to filter unknown sender messages.",
+      buttonText: "Go Back",
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -74,7 +86,7 @@ class Step1Page extends StatelessWidget {
                   children: [
                     const SizedBox(height: 16),
                     const Text(
-                      'Enable SMS Scanning',
+                      'Enable SMS Monitoring',
                       style: TextStyle(
                         fontSize: 30,
                         fontWeight: FontWeight.bold,
@@ -84,7 +96,7 @@ class Step1Page extends StatelessWidget {
                     ),
                     const SizedBox(height: 14),
                     Text(
-                      'To detect phishing in your messages, PhishSense needs permission to read incoming SMS on your device.',
+                      'PhishSense helps monitor incoming messages and detect possible phishing attempts in real time.',
                       style: TextStyle(
                         fontSize: 15,
                         color: Colors.grey[600],
@@ -170,7 +182,14 @@ class Step1Page extends StatelessWidget {
                 width: double.infinity,
                 height: 54,
                 child: ElevatedButton(
-                  onPressed: onContinue,
+                  onPressed: () {
+                    PermissionPage.show(
+                      context,
+                      type: PermissionType.sms,
+                      onAllow: onContinue,
+                      onDeny: () => _showRequiredPermissionError(context),
+                    );
+                  },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1A7A72),
                     foregroundColor: Colors.white,

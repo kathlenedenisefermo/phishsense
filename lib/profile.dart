@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'privacy_policy.dart';
@@ -49,6 +50,7 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
     "👨‍🔬", "👩‍🔬", "👨‍🎨", "👩‍🎨",
     "👨‍🚀", "👩‍🚀", "👨‍✈️", "👩‍✈️",
   ];
+
   bool _shareData = false;
   late bool _notificationPermission;
   late bool _showDetectionPopup;
@@ -61,6 +63,29 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
     _showDetectionPopup = widget.showDetectionPopup;
     _shareData = widget.shareAnonymousData;
   }
+
+  bool get _isIOS => !kIsWeb && Platform.isIOS;
+
+  String get _notificationTitle =>
+      _isIOS ? "PhishSense Alerts" : "Notification Permission";
+
+  String get _notificationSubtitle =>
+      _isIOS ? "Allow PhishSense protection alerts" : "Allow phishing alerts";
+
+  String get _spamTitle =>
+      _isIOS ? "iOS Message Filtering" : "Spam Management";
+
+  String get _spamSubtitle => _isIOS
+      ? "Use iOS filtering for suspicious messages from unknown senders"
+      : "Move detected messages to spam folder";
+
+  String get _shareDataSubtitle => _isIOS
+      ? "Help improve message filtering accuracy"
+      : "Help improve phishing detection accuracy";
+
+  String get _popupSubtitle => _isIOS
+      ? "Show safe/phishing analysis card again"
+      : "Show phishing/safe detection card again";
 
   bool get _canEdit {
     if (_lastUpdate == null) return true;
@@ -181,14 +206,14 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
               Navigator.pop(context);
             },
             child: const Text("Save"),
-          )
+          ),
         ],
       ),
     );
   }
 
   Future<void> _pickImage(ImageSource source) async {
-    Navigator.pop(context); // close the bottom sheet
+    Navigator.pop(context);
     final picker = ImagePicker();
     final picked = await picker.pickImage(source: source, imageQuality: 85);
     if (picked != null && mounted) {
@@ -481,19 +506,21 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
                             ),
                             _row(
                               icon: Icons.notifications_active,
-                              title: "Notification Permission",
-                              subtitle: "Allow phishing alerts",
+                              title: _notificationTitle,
+                              subtitle: _notificationSubtitle,
                               trailing: Switch(
                                 value: _notificationPermission,
                                 activeColor: const Color(0xFF1A7A72),
                                 onChanged: (v) async {
                                   final ok = await _confirm(
+                                    v ? "Turn On Notifications" : "Turn Off Notifications",
                                     v
-                                        ? "Turn On Notifications"
-                                        : "Turn Off Notifications",
-                                    v
-                                        ? "Are you sure you want to turn on phishing alert notifications?"
-                                        : "Are you sure you want to turn off phishing alert notifications?",
+                                        ? (_isIOS
+                                            ? "Are you sure you want to turn on PhishSense protection alerts on iOS?"
+                                            : "Are you sure you want to turn on phishing alert notifications?")
+                                        : (_isIOS
+                                            ? "Are you sure you want to turn off PhishSense protection alerts on iOS?"
+                                            : "Are you sure you want to turn off phishing alert notifications?"),
                                   );
 
                                   if (!ok) return;
@@ -507,44 +534,48 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
                             ),
                             _row(
                               icon: Icons.mobile_screen_share_outlined,
-                              title: "Share Anonymous Data",
-                              subtitle:
-                              "Help improve phishing detection accuracy",
+                              title: _isIOS ? "Improve Message Filtering" : "Share Anonymous Data",
+                              subtitle: _shareDataSubtitle,
                               trailing: Switch(
                                 value: _shareData,
                                 activeColor: const Color(0xFF1A7A72),
                                 onChanged: (v) {
                                   setState(() => _shareData = v);
+                                  widget.onChangeShareAnonymousData(v);
                                 },
                               ),
                             ),
                             _row(
                               icon: Icons.folder,
-                              title: "Spam Management",
-                              subtitle: "Move detected messages to spam folder",
+                              title: _spamTitle,
+                              subtitle: _spamSubtitle,
                               trailing: Switch(
                                 value: widget.spamFolderEnabled,
                                 activeColor: const Color(0xFF1A7A72),
                                 onChanged: (v) async {
                                   if (v) {
                                     final ok = await _confirm(
-                                      "Enable Spam Folder",
-                                      "Detected phishing messages will appear in the Spam Folder.",
+                                      _isIOS ? "Enable Message Filtering" : "Enable Spam Folder",
+                                      _isIOS
+                                          ? "Suspicious messages from unknown senders will be handled through iOS message filtering."
+                                          : "Detected phishing messages will appear in the Spam Folder.",
                                     );
                                     if (!ok) return;
                                     widget.onChangeSpamFolder(true);
                                     _closeSidebarThenShowNote(
-                                      "Spam Folder enabled.",
+                                      _isIOS ? "Message filtering enabled." : "Spam Folder enabled.",
                                     );
                                   } else {
                                     final ok = await _confirm(
-                                      "Disable Spam Folder",
-                                      "Are you sure you want to turn off Spam Folder?",
+                                      _isIOS ? "Disable Message Filtering" : "Disable Spam Folder",
+                                      _isIOS
+                                          ? "Are you sure you want to turn off iOS message filtering support?"
+                                          : "Are you sure you want to turn off Spam Folder?",
                                     );
                                     if (!ok) return;
                                     widget.onChangeSpamFolder(false);
                                     _closeSidebarThenShowNote(
-                                      "Spam Folder disabled.",
+                                      _isIOS ? "Message filtering disabled." : "Spam Folder disabled.",
                                     );
                                   }
                                 },
@@ -552,8 +583,8 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
                             ),
                             _row(
                               icon: Icons.visibility,
-                              title: "Show Detection Popup",
-                              subtitle: "Show phishing/safe detection card again",
+                              title: _isIOS ? "Show Message Analysis" : "Show Detection Popup",
+                              subtitle: _popupSubtitle,
                               trailing: Switch(
                                 value: _showDetectionPopup,
                                 activeColor: const Color(0xFF1A7A72),
@@ -561,8 +592,12 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
                                   final ok = await _confirm(
                                     v ? "Turn On Detection Popup" : "Turn Off Detection Popup",
                                     v
-                                        ? "Are you sure you want to turn on the phishing/safe detection popup again?"
-                                        : "Are you sure you want to turn off the phishing/safe detection popup?",
+                                        ? (_isIOS
+                                            ? "Are you sure you want to show the safe/phishing analysis popup again on iOS?"
+                                            : "Are you sure you want to turn on the phishing/safe detection popup again?")
+                                        : (_isIOS
+                                            ? "Are you sure you want to hide the safe/phishing analysis popup on iOS?"
+                                            : "Are you sure you want to turn off the phishing/safe detection popup?"),
                                   );
 
                                   if (!ok) return;
@@ -594,7 +629,7 @@ class _ProfileSidebarState extends State<ProfileSidebar> {
                           ),
                         ),
                       ),
-                    )
+                    ),
                   ],
                 ),
               ),

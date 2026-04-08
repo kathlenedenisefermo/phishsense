@@ -1,12 +1,26 @@
 import 'package:flutter/material.dart';
+import 'permission.dart';
+import 'error.dart';
 
 class Step2Page extends StatelessWidget {
   final VoidCallback onContinue;
+  final VoidCallback onContactsAllowed;
 
   const Step2Page({
     super.key,
     required this.onContinue,
+    required this.onContactsAllowed,
   });
+
+  void _showOptionalNotice(BuildContext context) {
+    ErrorPage.show(
+      context,
+      title: "Optional Permission",
+      message:
+          "You can allow contacts later in settings. For now, you can continue using PhishSense without it.",
+      buttonText: "OK",
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -66,6 +80,7 @@ class Step2Page extends StatelessWidget {
                 ],
               ),
             ),
+
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -84,7 +99,7 @@ class Step2Page extends StatelessWidget {
                     ),
                     const SizedBox(height: 14),
                     Text(
-                      'PhishSense uses your contacts to identify legitimate senders and reduce false positives when scanning messages.',
+                      'PhishSense can use your contacts to identify trusted senders. This step is optional and can be configured later.',
                       style: TextStyle(
                         fontSize: 15,
                         color: Colors.grey[600],
@@ -92,6 +107,7 @@ class Step2Page extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 28),
+
                     Center(
                       child: Container(
                         width: 300,
@@ -122,29 +138,50 @@ class Step2Page extends StatelessWidget {
                 ),
               ),
             ),
+
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 0, 24, 28),
-              child: SizedBox(
-                width: double.infinity,
-                height: 54,
-                child: ElevatedButton(
-                  onPressed: onContinue,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1A7A72),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
+              child: Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    height: 54,
+                    child: ElevatedButton(
+                      onPressed: () {
+                        // Simulate allowing contacts (no real permission)
+                        onContactsAllowed();
+                        onContinue();
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF1A7A72),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        elevation: 0,
+                      ),
+                      child: const Text(
+                        'Continue',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                     ),
-                    elevation: 0,
                   ),
-                  child: const Text(
-                    'Allow Contacts Access',
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
+
+                  const SizedBox(height: 10),
+
+                  TextButton(
+                    onPressed: () {
+                      _showOptionalNotice(context);
+                    },
+                    child: const Text(
+                      'Set up later',
+                      style: TextStyle(color: Colors.grey),
                     ),
                   ),
-                ),
+                ],
               ),
             ),
           ],

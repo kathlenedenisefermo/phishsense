@@ -1,69 +1,73 @@
-//
-//  MessageFilterExtension.swift
-//  PhishSenseFilter
-//
-//  Created by User on 3/4/26.
-//
-
 import IdentityLookup
+import Foundation
 
 final class MessageFilterExtension: ILMessageFilterExtension {}
 
-extension MessageFilterExtension: ILMessageFilterQueryHandling, ILMessageFilterCapabilitiesQueryHandling {
-    func handle(_ capabilitiesQueryRequest: ILMessageFilterCapabilitiesQueryRequest, context: ILMessageFilterExtensionContext, completion: @escaping (ILMessageFilterCapabilitiesQueryResponse) -> Void) {
-        let response = ILMessageFilterCapabilitiesQueryResponse()
+extension MessageFilterExtension: ILMessageFilterQueryHandling {
+    func handle(_ queryRequest: ILMessageFilterQueryRequest,
+                
+                
+                context: ILMessageFilterExtensionContext,
+                completion: @escaping (ILMessageFilterQueryResponse) -> Void) {
 
-        // TODO: Update subActions from ILMessageFilterSubAction enum
-        // response.transactionalSubActions = [...]
-        // response.promotionalSubActions   = [...]
+        let response = ILMessageFilterQueryResponse()
+
+        let sender = queryRequest.sender ?? "Unknown"
+        let message = queryRequest.messageBody ?? ""
+        let lower = message.lowercased()
+
+        let isSuspicious =
+            lower.contains("click") ||
+            lower.contains("verify") ||
+            lower.contains("urgent") ||
+            lower.contains("win")
+
+        response.action = isSuspicious ? .junk : .allow
+
+        saveLog(
+            sender: sender,
+            message: message,
+            label: isSuspicious ? "Phishing" : "Safe"
+        )
 
         completion(response)
     }
 
-    func handle(_ queryRequest: ILMessageFilterQueryRequest, context: ILMessageFilterExtensionContext, completion: @escaping (ILMessageFilterQueryResponse) -> Void) {
-        // First, check whether to filter using offline data (if possible).
-        let (offlineAction, offlineSubAction) = self.offlineAction(for: queryRequest)
+    private func saveLog(sender: String, message: String, label: String) {
+        let groupID = "group.com.phishsense.shared"
 
-        switch offlineAction {
-        case .allow, .junk, .promotion, .transaction:
-            // Based on offline data, we know this message should either be Allowed, Filtered as Junk, Promotional or Transactional. Send response immediately.
-            let response = ILMessageFilterQueryResponse()
-            response.action = offlineAction
-            response.subAction = offlineSubAction
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: groupID
+        ) else {
+            return
+        }
 
-            completion(response)
+        let fileURL = containerURL.appendingPathComponent("filtered_messages.json")
 
-        case .none:
-            // Based on offline data, we do not know whether this message should be Allowed or Filtered. Defer to network.
-            // Note: Deferring requests to network requires the extension target's Info.plist to contain a key with a URL to use. See documentation for details.
-            context.deferQueryRequestToNetwork() { (networkResponse, error) in
-                let response = ILMessageFilterQueryResponse()
-                response.action = .none
-                response.subAction = .none
+        var existing: [[String: String]] = []
 
-                if let networkResponse = networkResponse {
-                    // If we received a network response, parse it to determine an action to return in our response.
-                    (response.action, response.subAction) = self.networkAction(for: networkResponse)
-                } else {
-                    NSLog("Error deferring query request to network: \(String(describing: error))")
-                }
+        if let data = try? Data(contentsOf: fileURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
+            existing = json
+        }
 
-                completion(response)
-            }
+        let formatter = ISO8601DateFormatter()
 
-        @unknown default:
-            break
+        let newItem: [String: String] = [
+            "sender": sender,
+            "message": message,
+            "label": label,
+            "time": formatter.string(from: Date())
+        ]
+
+        existing.insert(newItem, at: 0)
+
+        if existing.count > 100 {
+            existing = Array(existing.prefix(100))
+        }
+
+        if let data = try? JSONSerialization.data(withJSONObject: existing, options: [.prettyPrinted]) {
+            try? data.write(to: fileURL, options: .atomic)
         }
     }
-
-    private func offlineAction(for queryRequest: ILMessageFilterQueryRequest) -> (ILMessageFilterAction, ILMessageFilterSubAction) {
-        // TODO: Replace with logic to perform offline check whether to filter first (if possible).
-        return (.none, .none)
-    }
-
-    private func networkAction(for networkResponse: ILNetworkResponse) -> (ILMessageFilterAction, ILMessageFilterSubAction) {
-        // TODO: Replace with logic to parse the HTTP response and data payload of `networkResponse` to return an action.
-        return (.none, .none)
-    }
-
 }

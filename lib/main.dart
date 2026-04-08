@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,7 @@ import 'name_page.dart';
 import 'messages.dart';
 import 'error.dart';
 import 'sync.dart';
+import 'ios_notice.dart';
 
 void main() {
   runApp(const MyApp());
@@ -61,6 +63,11 @@ class _AppFlowState extends State<AppFlow> {
 
   String _userName = "";
 
+  bool get _isIOS {
+    if (kIsWeb) return false;
+    return defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -70,11 +77,15 @@ class _AppFlowState extends State<AppFlow> {
   Future<void> _loadSetupState() async {
     final prefs = await SharedPreferences.getInstance();
     final complete = prefs.getBool('setup_complete') ?? false;
+
+    if (!mounted) return;
+
     setState(() {
       if (complete) {
         _userName = prefs.getString('user_name') ?? '';
         _smsPermission = prefs.getBool('sms_permission') ?? false;
-        _notificationPermission = prefs.getBool('notification_permission') ?? false;
+        _notificationPermission =
+            prefs.getBool('notification_permission') ?? false;
         _contactsPermission = prefs.getBool('contacts_permission') ?? false;
         _setupCompleted = true;
         _currentStep = 7;
@@ -93,10 +104,12 @@ class _AppFlowState extends State<AppFlow> {
   }
 
   void _nextStep() {
+    if (!mounted) return;
     setState(() => _currentStep++);
   }
 
   void _resetFlow() {
+    if (!mounted) return;
     setState(() {
       _currentStep = 0;
       _defaultSmsIndex = 1;
@@ -105,6 +118,8 @@ class _AppFlowState extends State<AppFlow> {
       _notificationPermission = false;
       _contactsPermission = false;
       _spamFolderEnabled = false;
+      _shareAnonymousData = false;
+      _showDetectionPopup = true;
       _userName = "";
     });
   }
@@ -130,7 +145,7 @@ class _AppFlowState extends State<AppFlow> {
         context,
         title: "SMS Access Required",
         message:
-            "You cannot continue unless SMS access is allowed because PhishSense needs to scan messages for phishing.",
+            "You cannot continue unless SMS access is allowed because PhishSense needs to monitor messages for phishing.",
       );
     });
   }
@@ -169,64 +184,48 @@ class _AppFlowState extends State<AppFlow> {
       case 1:
         return Step1Page(
           onContinue: () {
-            PermissionPage.show(
-              context,
-              type: PermissionType.sms,
-              onAllow: () {
-                Permission.sms.request().then((status) {
-                  if (status.isGranted) {
-                    setState(() => _smsPermission = true);
-                    _nextStep();
-                  } else {
-                    setState(() => _smsPermission = false);
-                    _showSmsError();
-                  }
-                });
-              },
-              onDeny: () {
-                setState(() => _smsPermission = false);
-                _showSmsError();
-              },
-            );
+            setState(() {
+              _smsPermission = true;
+              _currentStep = 2;
+            });
           },
         );
 
       case 2:
         return Step2Page(
+          onContactsAllowed: () {
+            setState(() => _contactsPermission = true);
+          },
           onContinue: () {
-            PermissionPage.show(
-              context,
-              type: PermissionType.contacts,
-              onAllow: () {
-                Permission.contacts.request().then((status) {
-                  if (status.isGranted) {
-                    setState(() => _contactsPermission = true);
-                    _nextStep();
-                  } else {
-                    setState(() => _contactsPermission = false);
-                    _showContactsError();
-                  }
-                });
-              },
-              onDeny: () {
-                setState(() => _contactsPermission = false);
-                _showContactsError();
-              },
-            );
+            setState(() => _currentStep = 3);
           },
         );
 
       case 3:
         return Step3Page(
-          onAllow: () {
-            Permission.notification.request().then((status) {
+          onAllow: () async {
+            if (!mounted) return;
+            
+            if (kIsWeb) {
               setState(() {
-                _notificationPermission = status.isGranted;
+                _notificationPermission = true;
                 _currentStep = 4;
               });
+              return;
+            }
+
+            final status = await Permission.notification.request();
+
+            if (!mounted) return;
+
+            setState(() {
+              _notificationPermission = status.isGranted;
+              _currentStep = 4;
             });
           },
           onSkip: () {
+            if (!mounted) return;
+            
             setState(() {
               _notificationPermission = false;
               _currentStep = 4;
@@ -245,22 +244,39 @@ class _AppFlowState extends State<AppFlow> {
         );
 
       case 5:
-        return DefaultSmsPage(
-          initialIndex: _defaultSmsIndex,
-          onSetDefault: (index) {
-            setState(() {
-              _defaultSmsIndex = index;
-              _setupCompleted = true;
-              _currentStep = 6;
-            });
-          },
-        );
+          if (_isIOS || kIsWeb) {
+            return IOSNoticePage(
+              onContinue: () async {
+                if (!mounted) return;
+
+                _setupCompleted = true;
+                await _saveSetupState();
+
+                if (!mounted) return;
+                setState(() {
+                  _currentStep = 7;
+                });
+              },
+            );
+          }
+
+          return DefaultSmsPage(
+            initialIndex: _defaultSmsIndex,
+            onSetDefault: (index) {
+              setState(() {
+                _defaultSmsIndex = index;
+                _setupCompleted = true;
+                _currentStep = 6;
+              });
+            },
+          );
 
       case 6:
         return SyncPage(
-          onDone: () {
+          onDone: () async {
             if (!mounted) return;
-            _saveSetupState();
+            await _saveSetupState();
+            if (!mounted) return;
             setState(() => _currentStep = 7);
           },
         );
@@ -269,6 +285,7 @@ class _AppFlowState extends State<AppFlow> {
         return MessagesPage(
           name: _userName,
           defaultSmsIndex: _defaultSmsIndex,
+          contactsPermission: _contactsPermission,
           notificationPermission: _notificationPermission,
           spamFolderEnabled: _spamFolderEnabled,
           shareAnonymousData: _shareAnonymousData,

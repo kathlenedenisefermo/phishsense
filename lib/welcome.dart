@@ -67,13 +67,20 @@ class WelcomePage extends StatelessWidget {
                 children: [
                   SizedBox(height: size.height * 0.08),
 
-                  // ===== Logo =====
-                  Stack(
-                    alignment: Alignment.centerLeft,
-                    children: [
-                      Padding(
-                        padding: EdgeInsets.only(left: size.width * 0.08),
-                        child: RichText(
+                  Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Image.asset(
+                          'assets/images/welcome.png',
+                          width: size.width * 0.1, // match text scale
+                          height: size.width * 0.1,
+                          fit: BoxFit.contain,
+                        ),
+
+                        const SizedBox(width: 6),
+
+                        RichText(
                           text: TextSpan(
                             children: [
                               TextSpan(
@@ -95,24 +102,13 @@ class WelcomePage extends StatelessWidget {
                             ],
                           ),
                         ),
-                      ),
-                      Positioned(
-                        left: 0,
-                        child: Transform.translate(
-                          offset: const Offset(-10, 0),
-                          child: Icon(
-                            Icons.phishing,
-                            size: size.width * 0.12,
-                            color: const Color(0xFF888880),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
 
                   const SizedBox(height: 8),
                   const Text(
-                    'Stay safe. Stay smart.',
+                    'Scan instantly to detect and identify safe or phishing messages',
+                    textAlign: TextAlign.center,
                     style: TextStyle(
                       fontSize: 14,
                       color: Color(0xFF888880),
@@ -153,7 +149,7 @@ class WelcomePage extends StatelessWidget {
                         ),
                         SizedBox(height: 8),
                         Text(
-                          'Detect phishing attempts and protect your personal information with real-time intelligent analysis.',
+                          'Manually scan SMS messages to identify phishing, scams, and suspicious links using intelligent on-device analysis.',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             fontSize: 14,

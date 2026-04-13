@@ -30,39 +30,6 @@ class NoticeDialog extends StatefulWidget {
 }
 
 class _NoticeDialogState extends State<NoticeDialog> {
-  final ScrollController _scrollController = ScrollController();
-  bool _hasReachedBottom = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _scrollController.addListener(_checkIfReachedBottom);
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkIfReachedBottom();
-    });
-  }
-
-  void _checkIfReachedBottom() {
-    if (!_scrollController.hasClients) return;
-
-    final position = _scrollController.position;
-    final reachedBottom =
-        position.pixels >= (position.maxScrollExtent - 8);
-
-    if (reachedBottom != _hasReachedBottom) {
-      setState(() {
-        _hasReachedBottom = reachedBottom;
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _scrollController.removeListener(_checkIfReachedBottom);
-    _scrollController.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -125,12 +92,11 @@ class _NoticeDialogState extends State<NoticeDialog> {
             ConstrainedBox(
               constraints: const BoxConstraints(maxHeight: 280),
               child: SingleChildScrollView(
-                controller: _scrollController,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'At PhishSense, your privacy is our highest priority. Below is a transparent summary of how we handle your data.',
+                      'PhishSense performs manual message scanning to help detect phishing attempts.',
                       style: TextStyle(
                         fontSize: 12,
                         color: Colors.grey[600],
@@ -140,25 +106,27 @@ class _NoticeDialogState extends State<NoticeDialog> {
                     const SizedBox(height: 14),
                     const _DataPointRow(
                       number: '1',
-                      title: 'SMS Messages',
+                      title: 'Manual Scanning',
                       detail:
-                      'We scan your incoming SMS messages locally on-device to detect phishing attempts. No messages are stored or transmitted.',
+                          'PhishSense only analyzes messages that you manually paste into the app. We do not access or monitor your SMS automatically.',
                     ),
                     const SizedBox(height: 10),
                     const _DataPointRow(
                       number: '2',
-                      title: 'Contacts',
+                      title: 'On-Device Privacy',
                       detail:
-                      'Your contacts list is used to verify known senders. This data stays on your device and is never uploaded to our servers.',
+                          'Your scanned messages are stored locally on your device unless you choose to delete them. We do not collect or access your personal conversations.',
                     ),
                     const SizedBox(height: 10),
                     const _DataPointRow(
                       number: '3',
-                      title: 'Threat Analysis',
+                      title: 'Model Improvement',
                       detail:
-                      'Anonymized threat pattern data may be submitted to improve detection models. No personally identifiable information is included.',
+                          'You may optionally submit anonymous feedback on scan results to help improve our detection model. No personal data is included.',
                     ),
-                    const SizedBox(height: 14),
+                    
+                    const SizedBox(height: 10),
+
                     Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
@@ -195,42 +163,23 @@ class _NoticeDialogState extends State<NoticeDialog> {
 
             const SizedBox(height: 20),
 
-            SizedBox(
-              width: double.infinity,
-              height: 30,
-              child: ElevatedButton(
-                onPressed: _hasReachedBottom ? widget.onAccept : null,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _hasReachedBottom
-                      ? const Color(0xFF1A7A72)
-                      : const Color(0xFFD3D3D3),
-                  foregroundColor:
-                  _hasReachedBottom ? Colors.white : Colors.white70,
-                  disabledBackgroundColor: const Color(0xFFD3D3D3),
-                  disabledForegroundColor: Colors.white70,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  elevation: _hasReachedBottom ? 4 : 0,
+            ElevatedButton(
+              onPressed: widget.onAccept, // ALWAYS ENABLED
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF1A7A72),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(6),
                 ),
-                child: const Text(
-                  'I Understand & Accept',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
+                elevation: 4,
               ),
-            ),
-
-            const SizedBox(height: 10),
-            Center(
-              child: Text(
-                _hasReachedBottom
-                    ? 'You can review this anytime in \nProfile → Privacy & Policy'
-                    : 'Read and scroll to the bottom \nto enable the accept button',
-                style: TextStyle(fontSize: 11, color: Colors.grey[400]),
+              child: const Text(
+                'I Understand & Accept',
                 textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ],

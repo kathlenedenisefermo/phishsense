@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "605252089782",
+    "project_id": "phishsense-86ed4",
+    "storage_bucket": "phishsense-86ed4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:605252089782:android:6d734a63e088eec0b43317",
+        "android_client_info": {
+          "package_name": "com.example.phishsense_sms"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDr1s0zmY37flRMdKJSFvxQ0vfKY__MMzY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -7,32 +7,15 @@ import 'services/phishing_detector.dart';
 import 'spam_folder.dart';
 import 'profile.dart';
 import 'conversation_page.dart';
-import 'compose.dart';
-import 'contacts_page.dart';
-
 
 class MessagesPage extends StatefulWidget {
   final String name;
-  final int defaultSmsIndex;
-  final bool contactsPermission;
-  final bool notificationPermission;
   final bool spamFolderEnabled;
-  final bool shareAnonymousData;
-  final bool showDetectionPopup;
-  final ValueChanged<bool> onChangeShareAnonymousData;
-  final ValueChanged<bool> onChangeShowDetectionPopup;
 
   const MessagesPage({
     super.key,
     required this.name,
-    required this.defaultSmsIndex,
-    required this.contactsPermission,
-    required this.notificationPermission,
     required this.spamFolderEnabled,
-    required this.shareAnonymousData,
-    required this.showDetectionPopup,
-    required this.onChangeShareAnonymousData,
-    required this.onChangeShowDetectionPopup,
   });
 
   @override
@@ -1036,29 +1019,18 @@ class _MessagesPageState extends State<MessagesPage>
   Widget build(BuildContext context) {
     final threads = _threads;
     final pendingCount = _messages.where((m) => m.classificationPending).length;
-
+    
     return Scaffold(
       key: scaffoldKey,
-      endDrawer: ProfileSidebar(
+      
+      drawer: ProfilePage(
         name: widget.name,
-        defaultSmsIndex: _defaultSmsIndex,
-        notificationPermission: _notificationPermission,
-        spamFolderEnabled: _spamFolderEnabled,
-        shareAnonymousData: _shareAnonymousData,
-        showDetectionPopup: _showDetectionPopup,
-        onChangeDefaultSms: (index) => setState(() => _defaultSmsIndex = index),
-        onChangeNotificationPermission: (v) =>
-            setState(() => _notificationPermission = v),
-        onChangeSpamFolder: (v) => setState(() => _spamFolderEnabled = v),
-        onChangeShareAnonymousData: (v) {
-          setState(() => _shareAnonymousData = v);
-          widget.onChangeShareAnonymousData(v);
-        },
-        onChangeShowDetectionPopup: (v) {
-          setState(() => _showDetectionPopup = v);
-          widget.onChangeShowDetectionPopup(v);
+        spamFolderEnabled: widget.spamFolderEnabled,
+        onSpamToggled: (v) {
+          widget.onSpamToggled(v);
         },
       ),
+    
       backgroundColor: const Color(0xFFF6F4EC),
       floatingActionButton: _selectedTab == 0
           ? FloatingActionButton(
@@ -1147,7 +1119,7 @@ class _MessagesPageState extends State<MessagesPage>
                   IconButton(
                     icon: const Icon(Icons.person, size: 30),
                     color: const Color(0xFF1A7A72),
-                    onPressed: () => scaffoldKey.currentState?.openEndDrawer(),
+                    onPressed: () => scaffoldKey.currentState?.openDrawer(),
                   ),
                 ],
               ),
@@ -1395,10 +1367,6 @@ class _MessagesPageState extends State<MessagesPage>
                             );
                           },
                         ),
-                  // ── Tab 1: Contacts ───────────────────────────────────
-                  ContactsPage(
-                    key: ValueKey(widget.contactsPermission),
-                    embedded: true,
                   ),
                 ],
               ),
@@ -1535,27 +1503,42 @@ class _TopHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       color: const Color(0xFF1A7A72),
-      padding: const EdgeInsets.fromLTRB(22, 12, 22, 16),
-      child: const Row(
+      padding: const EdgeInsets.fromLTRB(12, 12, 22, 16),
+      child: Row(
         children: [
-          Icon(Icons.phishing, color: Color(0xFF888880), size: 28),
-          SizedBox(width: 6),
-          Text(
+          // ✅ MENU BUTTON (OPEN DRAWER)
+          Builder(
+              builder: (context) => IconButton(
+                icon: const Icon(Icons.menu, color: Colors.white),
+                onPressed: () => Scaffold.of(context).openDrawer(),
+              ),
+            ),
+
+          const SizedBox(width: 4),
+
+          const Icon(Icons.phishing, color: Color(0xFF888880), size: 28),
+          const SizedBox(width: 6),
+
+          const Text(
             "Phish",
             style: TextStyle(
               color: Colors.white,
               fontSize: 28,
               fontWeight: FontWeight.bold,
-              shadows: [Shadow(blurRadius: 6, color: Colors.black26, offset: Offset(0, 2))],
+              shadows: [
+                Shadow(blurRadius: 6, color: Colors.black26, offset: Offset(0, 2))
+              ],
             ),
           ),
-          Text(
+          const Text(
             "Sense",
             style: TextStyle(
               color: Color(0xFFE0A800),
               fontSize: 28,
               fontWeight: FontWeight.bold,
-              shadows: [Shadow(blurRadius: 6, color: Colors.black26, offset: Offset(0, 2))],
+              shadows: [
+                Shadow(blurRadius: 6, color: Colors.black26, offset: Offset(0, 2))
+              ],
             ),
           ),
         ],

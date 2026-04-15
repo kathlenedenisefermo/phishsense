@@ -90,7 +90,9 @@ class _NoticeDialogState extends State<NoticeDialog> {
             const SizedBox(height: 16),
 
             ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 280),
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(context).size.height * 0.55,
+              ),
               child: SingleChildScrollView(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -163,22 +165,25 @@ class _NoticeDialogState extends State<NoticeDialog> {
 
             const SizedBox(height: 20),
 
-            ElevatedButton(
-              onPressed: widget.onAccept, // ALWAYS ENABLED
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF1A7A72),
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(6),
+            Center(
+              child: ElevatedButton(
+                onPressed: widget.onAccept, // ALWAYS ENABLED
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1A7A72),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  elevation: 4,
+                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
                 ),
-                elevation: 4,
-              ),
-              child: const Text(
-                'I Understand & Accept',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
+                child: const Text(
+                  'I Understand & Accept',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ),

@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -18,6 +20,8 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
   static const _manualKey      = 'manual_scan_logs';
   static const _spamKey        = 'spam_folder_logs';
   static const _spamEnabledKey = 'spam_folder_enabled';
+  static const _deviceIdKey    = 'phishsense_device_id';
+  static const _seenReportsKey = 'phishsense_seen_reports';
 
   List<Map<String, dynamic>> _allMessages     = [];
   List<Map<String, dynamic>> _threads         = [];
@@ -26,14 +30,17 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
   bool   _loading     = true;
   bool   _spamEnabled = true;
   String _searchQuery = '';
+  String _deviceId    = '';
   final  _searchCtrl  = TextEditingController();
   final  _scaffoldKey = GlobalKey<ScaffoldState>();
+  StreamSubscription<QuerySnapshot>? _globalReportSub;
 
   @override
   void initState() {
     super.initState();
     _loadSpamEnabled();
     _loadMessages();
+    _initDeviceAndCheckReports();
     _searchCtrl.addListener(() {
       setState(() {
         _searchQuery     = _searchCtrl.text.toLowerCase();
@@ -43,7 +50,259 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
   }
 
   @override
-  void dispose() { _searchCtrl.dispose(); super.dispose(); }
+  void dispose() {
+    _globalReportSub?.cancel();
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  // ── Device ID + report status check ───────────────────────────────────────
+
+  Future<void> _initDeviceAndCheckReports() async {
+    final p  = await SharedPreferences.getInstance();
+    var id   = p.getString(_deviceIdKey);
+    if (id == null || id.isEmpty) {
+      id = DateTime.now().millisecondsSinceEpoch.toString() +
+           '_' + (1000 + (DateTime.now().microsecond % 9000)).toString();
+      await p.setString(_deviceIdKey, id);
+    }
+    if (mounted) setState(() => _deviceId = id!);
+    // One-time check on launch for already-reviewed reports
+    await _checkReportStatuses(id!);
+    // Start real-time listener so notices fire instantly while app is open
+    _startGlobalReportListener(id!);
+  }
+
+  void _startGlobalReportListener(String deviceId) {
+    _globalReportSub?.cancel();
+    _globalReportSub = FirebaseFirestore.instance
+        .collection('reports')
+        .where('deviceId', isEqualTo: deviceId)
+        .where('status', whereIn: ['verified', 'rejected'])
+        .snapshots()
+        .listen((snap) async {
+      final p       = await SharedPreferences.getInstance();
+      final seenRaw = p.getString(_seenReportsKey);
+      final seen    = seenRaw != null
+          ? (jsonDecode(seenRaw) as List).cast<String>().toSet()
+          : <String>{};
+
+      bool messagesChanged = false;
+      final Set<String> newIds = {};
+      for (final doc in snap.docs) {
+        if (seen.contains(doc.id)) continue;
+        final data          = doc.data() as Map<String, dynamic>;
+        final status        = data['status']?.toString() ?? '';
+        final msgTime       = data['messageTime']?.toString() ?? '';
+        final originalLabel = data['originalLabel']?.toString().toLowerCase() ?? '';
+        newIds.add(doc.id);
+        seen.add(doc.id);
+        if (msgTime.isNotEmpty) {
+          await _applyReviewDecisionGlobal(msgTime, status, originalLabel);
+          messagesChanged = true;
+        }
+      }
+
+      await p.setString(_seenReportsKey, jsonEncode(seen.toList()));
+      if (messagesChanged && mounted) await _loadMessages();
+
+      // Show notice only for newly-seen reports
+      for (final doc in snap.docs) {
+        if (!newIds.contains(doc.id)) continue;
+        final data          = doc.data() as Map<String, dynamic>;
+        final status        = data['status']?.toString() ?? '';
+        final sender        = data['sender']?.toString() ?? 'Unknown';
+        final message       = data['message']?.toString() ?? '';
+        final originalLabel = data['originalLabel']?.toString().toLowerCase() ?? '';
+        if ((status == 'verified' || status == 'rejected') && mounted) {
+          _showReportResultNotice(sender, message, status, originalLabel: originalLabel);
+        }
+      }
+    }, onError: (e) => debugPrint('Global report listener error: $e'));
+  }
+
+  Future<void> _checkReportStatuses(String deviceId) async {
+    try {
+      final p        = await SharedPreferences.getInstance();
+      final seenRaw  = p.getString(_seenReportsKey);
+      final seen     = seenRaw != null ? (jsonDecode(seenRaw) as List).cast<String>().toSet() : <String>{};
+
+      final snap = await FirebaseFirestore.instance
+          .collection('reports')
+          .where('deviceId', isEqualTo: deviceId)
+          .where('status', whereIn: ['verified', 'rejected'])
+          .get();
+
+      bool anyApplied = false;
+      final Set<String> newIds = {};
+      for (final doc in snap.docs) {
+        final data          = doc.data();
+        final status        = data['status'] as String;
+        final originalLabel = data['originalLabel']?.toString().toLowerCase() ?? '';
+        final msgTime       = data['messageTime']?.toString() ?? '';
+
+        if (msgTime.isNotEmpty) {
+          await _applyReviewDecisionGlobal(msgTime, status, originalLabel);
+          anyApplied = true;
+        }
+
+        if (!seen.contains(doc.id)) {
+          newIds.add(doc.id);
+          seen.add(doc.id);
+        }
+      }
+
+      await p.setString(_seenReportsKey, jsonEncode(seen.toList()));
+      if (anyApplied && mounted) await _loadMessages();
+
+      // Show notice only for reports the user hasn't seen yet
+      for (final doc in snap.docs) {
+        if (!newIds.contains(doc.id)) continue;
+        final data      = doc.data();
+        final status    = data['status'] as String;
+        final sender    = data['sender']?.toString() ?? 'Unknown';
+        final message   = data['message']?.toString() ?? '';
+        final origLabel = data['originalLabel']?.toString().toLowerCase() ?? '';
+        if (mounted) _showReportResultNotice(sender, message, status, originalLabel: origLabel);
+      }
+    } catch (e) {
+      debugPrint('Report status check failed: $e');
+    }
+  }
+
+  /// Auto-applies the review decision to local SharedPreferences on app launch.
+  /// This ensures messages move to the correct folder without requiring the
+  /// user to open the conversation page.
+  Future<void> _applyReviewDecisionGlobal(String msgTime, String status, String originalLabel) async {
+    try {
+      final p       = await SharedPreferences.getInstance();
+      final spamRaw = p.getString(_spamKey);
+      final manRaw  = p.getString(_manualKey);
+      final spam    = spamRaw != null && spamRaw.isNotEmpty ? (jsonDecode(spamRaw) as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+      final man     = manRaw  != null && manRaw.isNotEmpty  ? (jsonDecode(manRaw)  as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+
+      final inboxIdx = man.indexWhere((m) => m['time']?.toString() == msgTime);
+      final spamIdx  = spam.indexWhere((m) => m['time']?.toString() == msgTime);
+
+      Map<String, dynamic>? entry;
+      bool wasInInbox = false;
+      if (inboxIdx != -1) { entry = Map<String, dynamic>.from(man[inboxIdx]);  wasInInbox = true; }
+      else if (spamIdx != -1) { entry = Map<String, dynamic>.from(spam[spamIdx]); wasInInbox = false; }
+      if (entry == null) return;
+
+      entry['verifiedByCrew'] = true;
+      final bool wasPhishing  = originalLabel == 'phishing';
+      final bool verified     = status == 'verified';
+      final String finalLabel = verified
+          ? (wasPhishing ? 'Safe' : 'Phishing')
+          : (wasPhishing ? 'Phishing' : 'Safe');
+      entry['label'] = finalLabel;
+      final bool shouldBeInInbox = finalLabel.toLowerCase() == 'safe';
+
+      if (wasInInbox) {
+        man.removeAt(inboxIdx);
+        if (shouldBeInInbox) {
+          man.insert(0, entry);
+          if (man.length > 200) man.removeRange(200, man.length);
+          await p.setString(_manualKey, jsonEncode(man));
+        } else {
+          await p.setString(_manualKey, jsonEncode(man));
+          if (!spam.any((m) => m['time']?.toString() == msgTime)) {
+            spam.insert(0, entry);
+            if (spam.length > 200) spam.removeRange(200, spam.length);
+            await p.setString(_spamKey, jsonEncode(spam));
+          }
+        }
+      } else {
+        spam.removeAt(spamIdx);
+        if (shouldBeInInbox) {
+          await p.setString(_spamKey, jsonEncode(spam));
+          if (!man.any((m) => m['time']?.toString() == msgTime)) {
+            man.insert(0, entry);
+            if (man.length > 200) man.removeRange(200, man.length);
+            await p.setString(_manualKey, jsonEncode(man));
+          }
+        } else {
+          spam.insert(0, entry);
+          if (spam.length > 200) spam.removeRange(200, spam.length);
+          await p.setString(_spamKey, jsonEncode(spam));
+        }
+      }
+    } catch (e) { debugPrint('Auto apply review decision error: $e'); }
+  }
+
+  void _showReportResultNotice(String sender, String message, String status,
+      {String originalLabel = ''}) {
+    final isVerified      = status == 'verified';
+    final wasPhishing     = originalLabel == 'phishing';
+    // Final classification = what the message ACTUALLY IS after review
+    // verified + wasPhishing  → report confirmed → message is Safe
+    // verified + wasSafe      → report confirmed → message is Phishing
+    // rejected + wasPhishing  → report wrong     → message stays Phishing
+    // rejected + wasSafe      → report wrong     → message stays Safe
+    final bool finallyPhishing = isVerified ? !wasPhishing : wasPhishing;
+    final bool movedToInbox    = !finallyPhishing;
+    final color   = movedToInbox ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+    final icon    = movedToInbox ? Icons.check_circle_outline : Icons.cancel_outlined;
+    final title   = isVerified ? 'Report Verified' : 'Report Reviewed';
+    final subtitle = movedToInbox
+        ? 'The message from "$sender" is confirmed safe and has been moved to your inbox.'
+        : 'The message from "$sender" is confirmed phishing. It remains in the Spam Folder.';
+    final preview = message.length > 80 ? '${message.substring(0, 80)}…' : message;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(.2),
+      builder: (_) => Material(
+        color: Colors.transparent,
+        child: Center(
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 28),
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(.12), blurRadius: 16, offset: const Offset(0, 4))],
+            ),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(icon, color: color, size: 40),
+              const SizedBox(height: 12),
+              Text(title, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: color,
+                  decoration: TextDecoration.none)),
+              const SizedBox(height: 8),
+              Text(subtitle, textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 13, color: Color(0xFF555555), height: 1.5,
+                      decoration: TextDecoration.none)),
+              const SizedBox(height: 10),
+              // Message preview box
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF6F4EC),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFDDD8CE))),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(sender, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+                      color: Color(0xFF555555), decoration: TextDecoration.none)),
+                  const SizedBox(height: 4),
+                  Text(preview, style: const TextStyle(fontSize: 12, color: Color(0xFF888888),
+                      height: 1.4, decoration: TextDecoration.none)),
+                ])),
+              const SizedBox(height: 16),
+              SizedBox(width: double.infinity, height: 42,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.of(context, rootNavigator: true).pop(),
+                  style: ElevatedButton.styleFrom(backgroundColor: color, foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                  child: const Text('OK', style: TextStyle(fontWeight: FontWeight.w600)))),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
 
   Future<void> _loadSpamEnabled() async {
     final p = await SharedPreferences.getInstance();
@@ -272,7 +531,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
 
   void _openSpamFolder() {
     if (!_spamEnabled) { _showCenterNotice('Spam Folder is disabled.'); return; }
-    Navigator.push(context, MaterialPageRoute(builder: (_) => SpamFolderPage(formatTime: _formatTime)))
+    Navigator.push(context, MaterialPageRoute(builder: (_) => SpamFolderPage(formatTime: _formatTime, deviceId: _deviceId)))
         .then((_) => _loadMessages());
   }
 
@@ -314,11 +573,11 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
             const Spacer(),
             IconButton(
               tooltip: _spamEnabled ? 'Spam Folder' : 'Spam Folder (disabled)',
-              icon: Icon(Icons.folder_special_outlined, color: _spamEnabled ? const Color(0xFF1A7A72) : const Color(0xFFBBBBBB)),
+              icon: Icon(Icons.folder, color: _spamEnabled ? const Color(0xFF1A7A72) : const Color(0xFFBBBBBB)),
               onPressed: _openSpamFolder),
             IconButton(
               tooltip: 'Profile',
-              icon: const Icon(Icons.person_outline, color: Color(0xFF1A7A72)),
+              icon: const Icon(Icons.person, color: Color(0xFF1A7A72)),
               onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
           ]),
         ),
@@ -375,7 +634,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
                           onTap: () => Navigator.push(context, MaterialPageRoute(
                             builder: (_) => _ConversationPage(
                               messages: thread['messages'] as List<Map<String, dynamic>>,
-                              sender: sender, formatTime: _formatTime,
+                              sender: sender, formatTime: _formatTime, deviceId: _deviceId,
                               onDeleteThread: () async {
                                 if (await _confirmDeleteThread(sender)) {
                                   await _deleteThread(sender);
@@ -443,7 +702,8 @@ class _ConversationPage extends StatefulWidget {
   final String sender;
   final String Function(String?) formatTime;
   final VoidCallback onDeleteThread;
-  const _ConversationPage({required this.messages, required this.sender, required this.formatTime, required this.onDeleteThread});
+  final String deviceId;
+  const _ConversationPage({required this.messages, required this.sender, required this.formatTime, required this.onDeleteThread, required this.deviceId});
   @override
   State<_ConversationPage> createState() => _ConversationPageState();
 }
@@ -454,27 +714,211 @@ class _ConversationPageState extends State<_ConversationPage> {
   late final List<GlobalKey> _itemKeys;
   bool   _searchActive = false;
   String _query        = '';
-  final Set<int> _reportedIndices = {};
-  String get _reportedKey => 'reported_msgs_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+
+  // Map of message time → status: 'pending' | 'verified' | 'rejected' | null
+  final Map<String, String> _reportStatus = {};
+  String get _statusKey => 'report_status_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  final Map<String, String> _correctedLabel = {};
+  final Set<String> _dismissedNotes = {};
+  String get _correctedLabelKey  => 'corrected_label_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  String get _dismissedNotesKey  => 'dismissed_notes_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  StreamSubscription<QuerySnapshot>? _firestoreSub;
 
   @override
-  void initState() { super.initState(); _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey()); _loadReported(); }
-
-  @override
-  void dispose() { _searchCtrl.dispose(); _scrollCtrl.dispose(); super.dispose(); }
-
-  Future<void> _loadReported() async {
-    final p = await SharedPreferences.getInstance();
-    final raw = p.getString(_reportedKey);
-    if (raw != null && raw.isNotEmpty) {
-      final list = (jsonDecode(raw) as List).cast<int>();
-      if (mounted) setState(() => _reportedIndices.addAll(list));
-    }
+  void initState() {
+    super.initState();
+    _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
+    _loadStatus();
+    _startRealtimeListener();
   }
 
-  Future<void> _saveReported() async {
+  @override
+  void dispose() {
+    _firestoreSub?.cancel();
+    _searchCtrl.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
+  void _startRealtimeListener() {
+    if (widget.deviceId.isEmpty) return;
+    _firestoreSub = FirebaseFirestore.instance
+        .collection('reports')
+        .where('deviceId', isEqualTo: widget.deviceId)
+        .where('sender', isEqualTo: widget.sender)
+        .snapshots()
+        .listen((snap) async {
+      bool changed = false;
+      for (final doc in snap.docs) {
+        final data        = doc.data() as Map<String, dynamic>;
+        final msgTime     = data['messageTime']?.toString() ?? '';
+        final status      = data['status']?.toString() ?? 'pending';
+        final prevStatus  = _reportStatus[msgTime];
+        if (msgTime.isNotEmpty && prevStatus != status) {
+          _reportStatus[msgTime] = status;
+          changed = true;
+          final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+          if (status == 'verified' || status == 'rejected') {
+            await _applyReviewDecision(msgTime, status, originalLabel);
+          }
+        }
+      }
+      if (changed && mounted) {
+        setState(() {});
+        await _saveStatus();
+      }
+    }, onError: (e) => debugPrint('Realtime listener error: $e'));
+  }
+
+  Future<void> _loadStatus() async {
+    final p    = await SharedPreferences.getInstance();
+    final raw  = p.getString(_statusKey);
+    final raw2 = p.getString(_correctedLabelKey);
+    if (raw != null && raw.isNotEmpty) {
+      final map = (jsonDecode(raw) as Map).cast<String, String>();
+      if (mounted) setState(() { _reportStatus.clear(); _reportStatus.addAll(map); });
+    }
+    if (raw2 != null && raw2.isNotEmpty) {
+      final map2 = (jsonDecode(raw2) as Map).cast<String, String>();
+      if (mounted) setState(() { _correctedLabel.clear(); _correctedLabel.addAll(map2); });
+    }
+    final raw3 = p.getString(_dismissedNotesKey);
+    if (raw3 != null && raw3.isNotEmpty) {
+      final list3 = (jsonDecode(raw3) as List).cast<String>();
+      if (mounted) setState(() { _dismissedNotes.clear(); _dismissedNotes.addAll(list3); });
+    }
+    // Also check Firestore for any status updates
+    await _syncStatusFromFirestore();
+  }
+
+  Future<void> _syncStatusFromFirestore() async {
+    if (widget.deviceId.isEmpty) return;
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('reports')
+          .where('deviceId', isEqualTo: widget.deviceId)
+          .where('sender', isEqualTo: widget.sender)
+          .get();
+      bool changed = false;
+      for (final doc in snap.docs) {
+        final data        = doc.data();
+        final msgTime     = data['messageTime']?.toString() ?? '';
+        final status      = data['status']?.toString() ?? 'pending';
+        final prevStatus  = _reportStatus[msgTime];
+        if (msgTime.isNotEmpty && prevStatus != status) {
+          _reportStatus[msgTime] = status;
+          changed = true;
+          // originalLabel is what the message was labeled BEFORE the report
+          final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+          await _applyReviewDecision(msgTime, status, originalLabel);
+        }
+      }
+      if (changed && mounted) {
+        setState(() {});
+        await _saveStatus();
+      }
+    } catch (e) { debugPrint('Firestore sync error: $e'); }
+  }
+
+  /// Applies the developer's review decision to local storage.
+  ///
+  /// Logic matrix:
+  ///   originalLabel=phishing + verified  → label was wrong → flip to Safe  → move inbox→inbox (already there, just relabel) or spam→inbox
+  ///   originalLabel=phishing + rejected  → label was right → keep Phishing → move inbox→spam (was incorrectly in inbox)
+  ///   originalLabel=safe     + verified  → label was wrong → flip to Phishing → move inbox→spam
+  ///   originalLabel=safe     + rejected  → label was right → keep Safe     → stays in inbox
+  Future<void> _applyReviewDecision(String msgTime, String status, String originalLabel) async {
+    try {
+      final p           = await SharedPreferences.getInstance();
+      const spamKey     = 'spam_folder_logs';
+      const manualKey   = 'manual_scan_logs';
+
+      final spamRaw = p.getString(spamKey);
+      final manRaw  = p.getString(manualKey);
+      final spam    = spamRaw != null && spamRaw.isNotEmpty ? (jsonDecode(spamRaw) as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+      final man     = manRaw  != null && manRaw.isNotEmpty  ? (jsonDecode(manRaw)  as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+
+      // Find the message in whichever list it currently lives in
+      final inboxIdx = man.indexWhere((m) => m['time']?.toString() == msgTime);
+      final spamIdx  = spam.indexWhere((m) => m['time']?.toString() == msgTime);
+
+      Map<String, dynamic>? entry;
+      bool wasInInbox = false;
+      if (inboxIdx != -1) { entry = Map<String, dynamic>.from(man[inboxIdx]);  wasInInbox = true; }
+      else if (spamIdx != -1) { entry = Map<String, dynamic>.from(spam[spamIdx]); wasInInbox = false; }
+      if (entry == null) return;
+
+      entry['verifiedByCrew'] = true;
+
+      // Determine the final correct label
+      final bool wasPhishing = originalLabel == 'phishing';
+      final bool verified    = status == 'verified';
+
+      // verified = report was correct, so original label was WRONG → flip it
+      // rejected = report was wrong, so original label was RIGHT → keep it
+      final String finalLabel = verified
+          ? (wasPhishing ? 'Safe' : 'Phishing')  // flip
+          : (wasPhishing ? 'Phishing' : 'Safe');  // keep original
+
+      entry['label'] = finalLabel;
+      // Store corrected label in memory so the bubble reads the right label
+      // even though widget.messages is stale (passed in from parent, not refreshed)
+      _correctedLabel[msgTime] = finalLabel;
+      final bool shouldBeInInbox = finalLabel.toLowerCase() == 'safe';
+
+      if (wasInInbox) {
+        man.removeAt(inboxIdx);
+        if (shouldBeInInbox) {
+          // Stay in inbox with corrected label
+          man.insert(0, entry);
+          if (man.length > 200) man.removeRange(200, man.length);
+          await p.setString(manualKey, jsonEncode(man));
+        } else {
+          // Move inbox → spam
+          await p.setString(manualKey, jsonEncode(man));
+          if (!spam.any((m) => m['time']?.toString() == msgTime)) {
+            spam.insert(0, entry);
+            if (spam.length > 200) spam.removeRange(200, spam.length);
+            await p.setString(spamKey, jsonEncode(spam));
+          }
+        }
+      } else {
+        spam.removeAt(spamIdx);
+        if (shouldBeInInbox) {
+          // Move spam → inbox
+          await p.setString(spamKey, jsonEncode(spam));
+          if (!man.any((m) => m['time']?.toString() == msgTime)) {
+            man.insert(0, entry);
+            if (man.length > 200) man.removeRange(200, man.length);
+            await p.setString(manualKey, jsonEncode(man));
+          }
+        } else {
+          // Stay in spam with corrected label
+          spam.insert(0, entry);
+          if (spam.length > 200) spam.removeRange(200, spam.length);
+          await p.setString(spamKey, jsonEncode(spam));
+        }
+      }
+    } catch (e) { debugPrint('Apply review decision error: $e'); }
+  }
+
+  Future<void> _saveStatus() async {
     final p = await SharedPreferences.getInstance();
-    await p.setString(_reportedKey, jsonEncode(_reportedIndices.toList()));
+    await p.setString(_statusKey, jsonEncode(_reportStatus));
+    await p.setString(_correctedLabelKey, jsonEncode(_correctedLabel));
+    await p.setString(_dismissedNotesKey, jsonEncode(_dismissedNotes.toList()));
+  }
+
+  String? _statusFor(int i) {
+    final time = widget.messages[i]['time']?.toString() ?? '';
+    return _reportStatus[time];
+  }
+
+  /// Returns the corrected label for a message if it has been reviewed,
+  /// otherwise returns the original label from widget.messages.
+  String _labelFor(int i) {
+    final time = widget.messages[i]['time']?.toString() ?? '';
+    return _correctedLabel[time] ?? (widget.messages[i]['label'] ?? '').toString();
   }
 
   List<int> get _matchIndices {
@@ -538,7 +982,9 @@ class _ConversationPageState extends State<_ConversationPage> {
 
   void _showReportSheet(BuildContext ctx, int index) {
     final msg        = widget.messages[index];
-    final isPhishing = (msg['label'] ?? '').toString().toLowerCase() == 'phishing';
+    // Use _labelFor so we always report against the current effective label,
+    // not the stale widget data (e.g. after a previous review corrected it).
+    final isPhishing = _labelFor(index).toLowerCase() == 'phishing';
     final title      = isPhishing ? 'Report Inaccurate Detection' : 'Report as Phishing';
     final subtitle   = isPhishing ? 'Why do you think this detection is wrong?' : 'Why do you think this message is phishing?';
     final reasons    = isPhishing
@@ -579,11 +1025,22 @@ class _ConversationPageState extends State<_ConversationPage> {
           TextButton(onPressed: () => Navigator.pop(dlgCtx), child: const Text('Cancel', style: TextStyle(color: Color(0xFF888888)))),
           ElevatedButton(
             onPressed: selected == null ? null : () {
+              final msgTime = msg['time']?.toString() ?? '';
               Navigator.pop(dlgCtx);
-              // Only fires on Submit — marks reported, persists, shows dialog
-              setState(() => _reportedIndices.add(index));
-              _saveReported();
-              _showVerificationDialog(ctx);
+              setState(() => _reportStatus[msgTime] = 'pending');
+              _saveStatus();
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) _showVerificationDialog(ctx);
+              });
+              _submitReport(
+                sender       : msg['sender']?.toString() ?? 'Unknown',
+                message      : msg['message']?.toString() ?? '',
+                originalLabel: _labelFor(index),
+                reason       : selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
+                type         : isPhishing ? 'inaccurate_detection' : 'reported_as_phishing',
+                deviceId     : widget.deviceId,
+                messageTime  : msgTime,
+              );
             },
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A7A72), foregroundColor: Colors.white,
                 disabledBackgroundColor: const Color(0xFF1A7A72).withOpacity(.4),
@@ -627,11 +1084,21 @@ class _ConversationPageState extends State<_ConversationPage> {
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
         itemCount: widget.messages.length,
         itemBuilder: (_, i) {
-          final msg        = widget.messages[i];
-          final isPhishing = (msg['label'] ?? '').toString().toLowerCase() == 'phishing';
-          final message    = (msg['message'] ?? '').toString();
-          final time       = widget.formatTime(msg['time'] as String?);
-          final reported   = _reportedIndices.contains(i);
+          final msg             = widget.messages[i];
+          final status          = _statusFor(i); // null | 'pending' | 'verified' | 'rejected'
+          // Use _labelFor so we always get the corrected label after review,
+          // since widget.messages is stale (the parent passed it in and never refreshes it).
+          final effectiveLabel     = _labelFor(i).toLowerCase();
+          final originalMsgLabel   = (msg['label'] ?? '').toString().toLowerCase();
+          final originallyPhishing = originalMsgLabel == 'phishing';
+          // The label to display is the effective (possibly corrected) one
+          final displayPhishing = effectiveLabel == 'phishing';
+          final message         = (msg['message'] ?? '').toString();
+          final time            = widget.formatTime(msg['time'] as String?);
+          final labelColor      = displayPhishing ? const Color(0xFFF2554F) : const Color(0xFF06C85E);
+          final labelText       = displayPhishing ? 'Phishing' : 'Safe';
+          final oldLabelText    = originallyPhishing ? 'Phishing' : 'Safe';
+          final newLabelText    = labelText;
 
           return Container(
             key: _itemKeys[i],
@@ -639,37 +1106,108 @@ class _ConversationPageState extends State<_ConversationPage> {
             decoration: BoxDecoration(color: const Color(0xFFF3EEE4), borderRadius: BorderRadius.circular(14)),
             clipBehavior: Clip.hardEdge,
             child: IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              Container(width: 5, color: isPhishing ? const Color(0xFFF2554F) : const Color(0xFF06C85E)),
+              Container(width: 5, color: labelColor),
               Expanded(child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 14, 14, 12),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   _highlightText(message, _query),
                   const SizedBox(height: 10),
-                  if (reported) ...[
-                    // Verification badge replaces label — only after Submit
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1A7A72).withOpacity(.08),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: const Color(0xFF1A7A72).withOpacity(.25))),
-                      child: Row(children: const [
-                        Icon(Icons.hourglass_top_rounded, size: 14, color: Color(0xFF1A7A72)),
-                        SizedBox(width: 6),
-                        Expanded(child: Text('Verification in Progress',
-                            style: TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600))),
-                      ])),
+
+                  // ── Status row ──────────────────────────────────────────
+                  if (status == 'pending') ...[
+                    // Pending: show hourglass, block re-reporting
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1A7A72).withOpacity(.08),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: const Color(0xFF1A7A72).withOpacity(.25))),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: const [
+                          Icon(Icons.hourglass_top_rounded, size: 14, color: Color(0xFF1A7A72)),
+                          SizedBox(width: 6),
+                          Text('Verification in Progress',
+                              style: TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
+                        ]))),
                     const SizedBox(height: 4),
                     Align(alignment: Alignment.centerRight,
                         child: Text(time, style: const TextStyle(fontSize: 11, color: Color(0xFF777777)))),
-                  ] else
+
+                  ] else if (status == 'verified' || status == 'rejected') ...[
+                    // Reviewed: label + time row
                     Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(color: labelColor, borderRadius: BorderRadius.circular(20)),
+                        child: Text(labelText,
+                            style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600))),
+                      const Spacer(),
+                      Text(time, style: const TextStyle(fontSize: 11, color: Color(0xFF777777))),
+                    ]),
+                    const SizedBox(height: 6),
+                    // Developer-reviewed banner (dismissible)
+                    if (!_dismissedNotes.contains(msg['time']?.toString() ?? '')) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
                         decoration: BoxDecoration(
-                          color: isPhishing ? const Color(0xFFF2554F) : const Color(0xFF06C85E),
-                          borderRadius: BorderRadius.circular(20)),
-                        child: Text(isPhishing ? 'Phishing' : 'Safe',
+                          color: status == 'verified'
+                              ? const Color(0xFF1A7A72).withOpacity(.08)
+                              : const Color(0xFFF2554F).withOpacity(.08),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: status == 'verified'
+                                ? const Color(0xFF1A7A72).withOpacity(.30)
+                                : const Color(0xFFF2554F).withOpacity(.30))),
+                        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Icon(
+                            status == 'verified' ? Icons.verified_outlined : Icons.cancel_outlined,
+                            size: 14,
+                            color: status == 'verified' ? const Color(0xFF1A7A72) : const Color(0xFFF2554F)),
+                          const SizedBox(width: 7),
+                          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text(
+                              status == 'verified' ? 'Reviewed & Verified by Developers' : 'Reviewed & Rejected by Developers',
+                              style: TextStyle(
+                                fontSize: 11, fontWeight: FontWeight.w700,
+                                color: status == 'verified' ? const Color(0xFF1A7A72) : const Color(0xFFF2554F))),
+                            const SizedBox(height: 2),
+                            Text(
+                              status == 'verified'
+                                  ? 'Our team confirmed your report was accurate. This message has been reclassified from $oldLabelText to $newLabelText.'
+                                  : 'Our team reviewed your report and confirmed this message is $oldLabelText. The original classification was correct.',
+                              style: const TextStyle(fontSize: 11, color: Color(0xFF666666), height: 1.4)),
+                          ])),
+                          GestureDetector(
+                            onTap: () {
+                              final t = msg['time']?.toString() ?? '';
+                              setState(() => _dismissedNotes.add(t));
+                              _saveStatus();
+                            },
+                            child: const Padding(
+                              padding: EdgeInsets.only(left: 4),
+                              child: Icon(Icons.close, size: 14, color: Color(0xFFAAAAAA)))),
+                        ])),
+                      const SizedBox(height: 6),
+                    ],
+                    // Re-enable report button after review
+                    GestureDetector(
+                      onTap: () => _showReportSheet(ctx, i),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        const Icon(Icons.flag_outlined, size: 13, color: Color(0xFFAAAAAA)),
+                        const SizedBox(width: 4),
+                        Text(displayPhishing ? 'Report Inaccurate Detection' : 'Report as Phishing',
+                            style: const TextStyle(fontSize: 12, color: Color(0xFFAAAAAA))),
+                      ])),
+
+                  ] else ...[
+                    // No report yet: show label + report button
+                    Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(color: labelColor, borderRadius: BorderRadius.circular(20)),
+                        child: Text(labelText,
                             style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600))),
                       const SizedBox(width: 8),
                       Expanded(child: GestureDetector(
@@ -677,11 +1215,12 @@ class _ConversationPageState extends State<_ConversationPage> {
                         child: Row(mainAxisSize: MainAxisSize.min, children: [
                           const Icon(Icons.flag_outlined, size: 13, color: Color(0xFFAAAAAA)),
                           const SizedBox(width: 4),
-                          Flexible(child: Text(isPhishing ? 'Report Inaccurate Detection' : 'Report as Phishing',
+                          Flexible(child: Text(originallyPhishing ? 'Report Inaccurate Detection' : 'Report as Phishing',
                               style: const TextStyle(fontSize: 12, color: Color(0xFFAAAAAA)), overflow: TextOverflow.ellipsis)),
                         ]))),
                       Text(time, style: const TextStyle(fontSize: 11, color: Color(0xFF777777))),
                     ]),
+                  ],
                 ]),
               )),
             ])),
@@ -698,7 +1237,8 @@ class _ConversationPageState extends State<_ConversationPage> {
 
 class SpamFolderPage extends StatefulWidget {
   final String Function(String?) formatTime;
-  const SpamFolderPage({super.key, required this.formatTime});
+  final String deviceId;
+  const SpamFolderPage({super.key, required this.formatTime, required this.deviceId});
   @override
   State<SpamFolderPage> createState() => _SpamFolderPageState();
 }
@@ -712,9 +1252,134 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
   bool _loading = true;
   int? _autoDeletionDays;
   static const _deletionOptions = [(label: 'Never', days: -1), (label: '7 days', days: 7), (label: '14 days', days: 14), (label: '30 days', days: 30)];
+  StreamSubscription<QuerySnapshot>? _reviewSub;
 
   @override
-  void initState() { super.initState(); _loadPref(); _loadSpam(); }
+  void initState() {
+    super.initState();
+    _loadPref();
+    _loadSpam();
+    _startReviewListener();
+  }
+
+  @override
+  void dispose() {
+    _reviewSub?.cancel();
+    super.dispose();
+  }
+
+  /// Listens for any report on this device transitioning to verified/rejected.
+  /// When one does, apply the decision to local storage first, then reload so
+  /// the UI reflects the move-to-inbox immediately without a race condition.
+  void _startReviewListener() {
+    if (widget.deviceId.isEmpty) return;
+    _reviewSub = FirebaseFirestore.instance
+        .collection('reports')
+        .where('deviceId', isEqualTo: widget.deviceId)
+        .where('status', whereIn: ['verified', 'rejected'])
+        .snapshots()
+        .listen((snap) async {
+      bool anyMoved = false;
+      for (final doc in snap.docs) {
+        final data          = doc.data() as Map<String, dynamic>;
+        final msgTime       = data['messageTime']?.toString() ?? '';
+        final status        = data['status']?.toString() ?? '';
+        final originalLabel = data['originalLabel']?.toString().toLowerCase() ?? '';
+        if (msgTime.isNotEmpty) {
+          final movedToInbox = await _applyReviewDecision(msgTime, status, originalLabel);
+          if (movedToInbox) anyMoved = true;
+        }
+      }
+      if (mounted) {
+        await _loadSpam();
+        // Show snackbar on the spam list after reload — message is already gone from list
+        if (anyMoved) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: const Row(children: [
+              Icon(Icons.check_circle_outline, color: Colors.white, size: 18),
+              SizedBox(width: 10),
+              Expanded(child: Text('Message confirmed safe and moved to Inbox',
+                  style: TextStyle(fontWeight: FontWeight.w600))),
+            ]),
+            backgroundColor: const Color(0xFF1A7A72),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ));
+        }
+      }
+    }, onError: (e) => debugPrint('SpamFolder review listener error: $e'));
+  }
+
+  /// Mirrors the logic of IOSMessagesPage._applyReviewDecisionGlobal so that
+  /// SpamFolderPage can update SharedPreferences without depending on the
+  /// parent page's listener running first.
+  /// Returns true if the message was moved out of spam to inbox.
+  Future<bool> _applyReviewDecision(String msgTime, String status, String originalLabel) async {
+    try {
+      final p       = await SharedPreferences.getInstance();
+      final spamRaw = p.getString(_spamKey);
+      final manRaw  = p.getString(_manualKey);
+      final spam    = spamRaw != null && spamRaw.isNotEmpty
+          ? (jsonDecode(spamRaw) as List).cast<Map<String, dynamic>>()
+          : <Map<String, dynamic>>[];
+      final man     = manRaw != null && manRaw.isNotEmpty
+          ? (jsonDecode(manRaw) as List).cast<Map<String, dynamic>>()
+          : <Map<String, dynamic>>[];
+
+      final spamIdx  = spam.indexWhere((m) => m['time']?.toString() == msgTime);
+      final inboxIdx = man.indexWhere((m) => m['time']?.toString() == msgTime);
+
+      Map<String, dynamic>? entry;
+      bool wasInSpam = false;
+      if (spamIdx != -1)  { entry = Map<String, dynamic>.from(spam[spamIdx]);  wasInSpam = true; }
+      else if (inboxIdx != -1) { entry = Map<String, dynamic>.from(man[inboxIdx]); wasInSpam = false; }
+      if (entry == null) return false;
+      if (entry['verifiedByCrew'] == true) return false;
+
+      entry['verifiedByCrew'] = true;
+      final bool wasPhishing = originalLabel == 'phishing';
+      final bool verified    = status == 'verified';
+      final String finalLabel = verified
+          ? (wasPhishing ? 'Safe' : 'Phishing')
+          : (wasPhishing ? 'Phishing' : 'Safe');
+      entry['label'] = finalLabel;
+      final bool shouldBeInInbox = finalLabel.toLowerCase() == 'safe';
+
+      if (wasInSpam) {
+        spam.removeAt(spamIdx);
+        if (shouldBeInInbox) {
+          await p.setString(_spamKey, jsonEncode(spam));
+          if (!man.any((m) => m['time']?.toString() == msgTime)) {
+            man.insert(0, entry);
+            if (man.length > 200) man.removeRange(200, man.length);
+            await p.setString(_manualKey, jsonEncode(man));
+          }
+          return true; // moved from spam to inbox
+        } else {
+          spam.insert(0, entry);
+          if (spam.length > 200) spam.removeRange(200, spam.length);
+          await p.setString(_spamKey, jsonEncode(spam));
+          return false;
+        }
+      } else {
+        man.removeAt(inboxIdx);
+        if (shouldBeInInbox) {
+          man.insert(0, entry);
+          if (man.length > 200) man.removeRange(200, man.length);
+          await p.setString(_manualKey, jsonEncode(man));
+        } else {
+          await p.setString(_manualKey, jsonEncode(man));
+          if (!spam.any((m) => m['time']?.toString() == msgTime)) {
+            spam.insert(0, entry);
+            if (spam.length > 200) spam.removeRange(200, spam.length);
+            await p.setString(_spamKey, jsonEncode(spam));
+          }
+        }
+        return false;
+      }
+    } catch (e) { debugPrint('SpamFolder apply review decision error: $e'); return false; }
+  }
 
   Future<void> _loadPref() async {
     final p = await SharedPreferences.getInstance();
@@ -875,8 +1540,19 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
           ElevatedButton(
             onPressed: selected == null ? null : () {
               Navigator.pop(dlgCtx);
-              onReported?.call(); // fires only here — on Submit
+              onReported?.call();
               _showVerificationDialog(ctx);
+              final msgs   = _spamMessages.where((m) => (m['sender'] ?? '') == sender).toList();
+              final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
+              _submitReport(
+                sender       : sender,
+                message      : sample['message']?.toString() ?? '',
+                originalLabel: 'Phishing',
+                reason       : selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
+                type         : 'inaccurate_detection',
+                deviceId     : widget.deviceId,
+                messageTime  : sample['time']?.toString() ?? '',
+              );
             },
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1A7A72), foregroundColor: Colors.white,
                 disabledBackgroundColor: const Color(0xFF1A7A72).withOpacity(.4),
@@ -975,7 +1651,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                       decoration: BoxDecoration(color: const Color(0xFF1A7A72).withOpacity(.10), borderRadius: BorderRadius.circular(20)),
                       child: Row(mainAxisSize: MainAxisSize.min, children: [
-                        const Icon(Icons.person_outline, size: 13, color: Color(0xFF1A7A72)),
+                        const Icon(Icons.person, size: 13, color: Color(0xFF1A7A72)),
                         const SizedBox(width: 5),
                         Text('$senderCount sender${senderCount != 1 ? 's' : ''}',
                             style: const TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
@@ -1027,6 +1703,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                 onDelete: () => _deleteFromSpam(sender),
                                 onConfirmDelete: () => _confirmDelete(sender),
                                 onReport: (onReported) => _showReportSheet(ctx, sender, onReported),
+                                deviceId: widget.deviceId,
                               ))).then((_) => _loadSpam()),
                             child: Padding(
                               padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
@@ -1073,9 +1750,11 @@ class _SpamConversationPage extends StatefulWidget {
   final VoidCallback onDelete;
   final Future<bool> Function() onConfirmDelete;
   final void Function(VoidCallback onReported) onReport;
+  final String deviceId;
   const _SpamConversationPage({
     required this.messages, required this.sender, required this.formatTime,
-    required this.onRestore, required this.onDelete, required this.onConfirmDelete, required this.onReport});
+    required this.onRestore, required this.onDelete, required this.onConfirmDelete,
+    required this.onReport, required this.deviceId});
   @override
   State<_SpamConversationPage> createState() => _SpamConversationPageState();
 }
@@ -1086,24 +1765,265 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   late final List<GlobalKey> _itemKeys;
   bool   _searchActive    = false;
   String _query           = '';
-  bool   _senderReported  = false;
-
-  String get _spamReportedKey => 'spam_reported_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  // Per-message report status keyed by message time
+  final Map<String, String> _reportStatus = {};
+  final Set<String> _dismissedNotes = {};
+  String get _statusKey         => 'spam_report_status_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  String get _dismissedNotesKey => 'spam_dismissed_notes_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+  StreamSubscription<QuerySnapshot>? _firestoreSub;
 
   @override
-  void initState() { super.initState(); _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey()); _loadSenderReported(); }
-
-  @override
-  void dispose() { _searchCtrl.dispose(); _scrollCtrl.dispose(); super.dispose(); }
-
-  Future<void> _loadSenderReported() async {
-    final p = await SharedPreferences.getInstance();
-    if (mounted) setState(() => _senderReported = p.getBool(_spamReportedKey) ?? false);
+  void initState() {
+    super.initState();
+    _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
+    _loadAndSyncStatus();
+    _startRealtimeListener();
   }
 
-  Future<void> _saveSenderReported() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setBool(_spamReportedKey, true);
+  @override
+  void dispose() {
+    _firestoreSub?.cancel();
+    _searchCtrl.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
+  void _startRealtimeListener() {
+    if (widget.deviceId.isEmpty) return;
+    final messageTimes = widget.messages
+        .map((m) => m['time']?.toString() ?? '')
+        .where((t) => t.isNotEmpty)
+        .toList();
+    if (messageTimes.isEmpty) return;
+    _firestoreSub = FirebaseFirestore.instance
+        .collection('reports')
+        .where('deviceId', isEqualTo: widget.deviceId)
+        .where('messageTime', whereIn: messageTimes)
+        .snapshots()
+        .listen((snap) async {
+      bool changed = false;
+      for (final doc in snap.docs) {
+        final data          = doc.data() as Map<String, dynamic>;
+        final msgTime       = data['messageTime']?.toString() ?? '';
+        final status        = data['status']?.toString() ?? 'pending';
+        final prevStatus    = _reportStatus[msgTime];
+        if (msgTime.isNotEmpty && prevStatus != status) {
+          _reportStatus[msgTime] = status;
+          changed = true;
+          final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+          final sender        = data['sender']?.toString() ?? 'Unknown';
+          final message       = data['message']?.toString() ?? '';
+          if (status == 'verified' || status == 'rejected') {
+            final movedOut = await _applyReviewDecision(msgTime, status, originalLabel);
+            if (mounted) {
+              _showLocalReportResultNotice(sender, message, status,
+                  originalLabel: originalLabel, popToInbox: movedOut);
+            }
+          }
+        }
+      }
+      if (!mounted) return;
+      if (changed) {
+        setState(() {});
+        final p = await SharedPreferences.getInstance();
+        await p.setString(_statusKey, jsonEncode(_reportStatus));
+      }
+    }, onError: (e) => debugPrint('Spam realtime listener error: $e'));
+  }
+
+  Future<void> _loadAndSyncStatus() async {
+    final p    = await SharedPreferences.getInstance();
+    final raw  = p.getString(_statusKey);
+    final raw2 = p.getString(_dismissedNotesKey);
+    if (raw != null && raw.isNotEmpty) {
+      final map = (jsonDecode(raw) as Map).cast<String, String>();
+      if (mounted) setState(() { _reportStatus.clear(); _reportStatus.addAll(map); });
+    }
+    if (raw2 != null && raw2.isNotEmpty) {
+      final list = (jsonDecode(raw2) as List).cast<String>();
+      if (mounted) setState(() { _dismissedNotes.clear(); _dismissedNotes.addAll(list); });
+    }
+    await _syncStatusFromFirestore();
+  }
+
+  Future<void> _syncStatusFromFirestore() async {
+    if (widget.deviceId.isEmpty) return;
+    try {
+      final messageTimes = widget.messages
+          .map((m) => m['time']?.toString() ?? '')
+          .where((t) => t.isNotEmpty)
+          .toList();
+      if (messageTimes.isEmpty) return;
+      final snap = await FirebaseFirestore.instance
+          .collection('reports')
+          .where('deviceId', isEqualTo: widget.deviceId)
+          .where('messageTime', whereIn: messageTimes)
+          .get();
+      bool changed        = false;
+      bool noticeMovedOut = false;
+      String noticeSender = '', noticeMessage = '', noticeStatus = '', noticeLabel = '';
+      for (final doc in snap.docs) {
+        final data          = doc.data();
+        final msgTime       = data['messageTime']?.toString() ?? '';
+        final status        = data['status']?.toString() ?? 'pending';
+        final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+        if (msgTime.isNotEmpty && _reportStatus[msgTime] != status) {
+          _reportStatus[msgTime] = status;
+          changed = true;
+          if (status == 'verified' || status == 'rejected') {
+            final movedOut = await _applyReviewDecision(msgTime, status, originalLabel);
+            if (movedOut) noticeMovedOut = true;
+            noticeSender  = data['sender']?.toString() ?? 'Unknown';
+            noticeMessage = data['message']?.toString() ?? '';
+            noticeStatus  = status;
+            noticeLabel   = originalLabel;
+          }
+        }
+      }
+      if (changed && mounted) {
+        setState(() {});
+        final p = await SharedPreferences.getInstance();
+        await p.setString(_statusKey, jsonEncode(_reportStatus));
+        await p.setString(_dismissedNotesKey, jsonEncode(_dismissedNotes.toList()));
+        if (noticeStatus.isNotEmpty) {
+          _showLocalReportResultNotice(noticeSender, noticeMessage, noticeStatus,
+              originalLabel: noticeLabel, popToInbox: noticeMovedOut);
+        }
+      }
+    } catch (e) { debugPrint('Spam Firestore sync error: $e'); }
+  }
+
+  void _showLocalReportResultNotice(String sender, String message, String status,
+      {String originalLabel = '', bool popToInbox = false}) {
+    final isVerified       = status == 'verified';
+    final wasPhishing      = originalLabel == 'phishing';
+    final bool finallyPhishing = isVerified ? !wasPhishing : wasPhishing;
+    final bool movedToInbox    = !finallyPhishing;
+    final color    = movedToInbox ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+    final icon     = movedToInbox ? Icons.check_circle_outline : Icons.cancel_outlined;
+    final title    = isVerified ? 'Report Verified' : 'Report Reviewed';
+    final subtitle = movedToInbox
+        ? 'The message from "$sender" is confirmed safe and has been moved to your inbox.'
+        : 'The message from "$sender" is confirmed phishing. It remains in the Spam Folder.';
+    final preview  = message.length > 80 ? '\${message.substring(0, 80)}…' : message;
+    final nav      = Navigator.of(context);
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(.2),
+      builder: (dlgCtx) => Material(
+        color: Colors.transparent,
+        child: Center(child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 28),
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(.12), blurRadius: 16, offset: const Offset(0, 4))]),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, color: color, size: 40),
+            const SizedBox(height: 12),
+            Text(title, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: color, decoration: TextDecoration.none)),
+            const SizedBox(height: 8),
+            Text(subtitle, textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 13, color: Color(0xFF555555), height: 1.5, decoration: TextDecoration.none)),
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(color: const Color(0xFFF6F4EC), borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFDDD8CE))),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(sender, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF555555), decoration: TextDecoration.none)),
+                const SizedBox(height: 4),
+                Text(preview, style: const TextStyle(fontSize: 12, color: Color(0xFF888888), height: 1.4, decoration: TextDecoration.none)),
+              ])),
+            const SizedBox(height: 16),
+            SizedBox(width: double.infinity, height: 42,
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.of(dlgCtx).pop();
+                  if (popToInbox) nav.popUntil((route) => route.isFirst);
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: color, foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                child: const Text('OK', style: TextStyle(fontWeight: FontWeight.w600)))),
+          ]),
+        )),
+      ),
+    );
+  }
+
+  /// Returns true if the message was moved OUT of spam (so the page should pop).
+  Future<bool> _applyReviewDecision(String msgTime, String status, String originalLabel) async {
+    try {
+      final p           = await SharedPreferences.getInstance();
+      const spamKey     = 'spam_folder_logs';
+      const manualKey   = 'manual_scan_logs';
+
+      final spamRaw = p.getString(spamKey);
+      final manRaw  = p.getString(manualKey);
+      final spam    = spamRaw != null && spamRaw.isNotEmpty ? (jsonDecode(spamRaw) as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+      final man     = manRaw  != null && manRaw.isNotEmpty  ? (jsonDecode(manRaw)  as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+
+      final inboxIdx = man.indexWhere((m) => m['time']?.toString() == msgTime);
+      final spamIdx  = spam.indexWhere((m) => m['time']?.toString() == msgTime);
+
+      Map<String, dynamic>? entry;
+      bool wasInInbox = false;
+      if (inboxIdx != -1) { entry = Map<String, dynamic>.from(man[inboxIdx]);  wasInInbox = true; }
+      else if (spamIdx != -1) { entry = Map<String, dynamic>.from(spam[spamIdx]); wasInInbox = false; }
+      if (entry == null) return false;
+
+      entry['verifiedByCrew'] = true;
+
+      final bool wasPhishing     = originalLabel == 'phishing';
+      final bool verified        = status == 'verified';
+      final String finalLabel    = verified
+          ? (wasPhishing ? 'Safe' : 'Phishing')
+          : (wasPhishing ? 'Phishing' : 'Safe');
+      entry['label'] = finalLabel;
+      final bool shouldBeInInbox = finalLabel.toLowerCase() == 'safe';
+
+      if (wasInInbox) {
+        man.removeAt(inboxIdx);
+        if (shouldBeInInbox) {
+          man.insert(0, entry);
+          if (man.length > 200) man.removeRange(200, man.length);
+          await p.setString(manualKey, jsonEncode(man));
+        } else {
+          await p.setString(manualKey, jsonEncode(man));
+          if (!spam.any((m) => m['time']?.toString() == msgTime)) {
+            spam.insert(0, entry);
+            if (spam.length > 200) spam.removeRange(200, spam.length);
+            await p.setString(spamKey, jsonEncode(spam));
+          }
+        }
+        return false; // was in inbox, didn't move out of spam view
+      } else {
+        spam.removeAt(spamIdx);
+        if (shouldBeInInbox) {
+          await p.setString(spamKey, jsonEncode(spam));
+          if (!man.any((m) => m['time']?.toString() == msgTime)) {
+            man.insert(0, entry);
+            if (man.length > 200) man.removeRange(200, man.length);
+            await p.setString(manualKey, jsonEncode(man));
+          }
+          return true; // was in spam, now moved to inbox → pop the page
+        } else {
+          spam.insert(0, entry);
+          if (spam.length > 200) spam.removeRange(200, spam.length);
+          await p.setString(spamKey, jsonEncode(spam));
+          return false; // stayed in spam
+        }
+      }
+    } catch (e) {
+      debugPrint('Spam apply review decision error: $e');
+      return false;
+    }
+  }
+
+  String? _statusFor(int i) {
+    final time = widget.messages[i]['time']?.toString() ?? '';
+    return _reportStatus[time];
   }
 
   List<int> get _matchIndices {
@@ -1144,12 +2064,14 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             label: 'Report Inaccurate Detection',
             onTap: () {
               Navigator.pop(ctx);
-              // Pass a callback that fires ONLY when the user taps Submit in the dialog
               widget.onReport(() {
-                if (mounted) {
-                  setState(() => _senderReported = true);
-                  _saveSenderReported();
-                }
+                // Set pending status for all messages from this sender immediately
+                setState(() {
+                  for (final msg in widget.messages) {
+                    final t = msg['time']?.toString() ?? '';
+                    if (t.isNotEmpty) _reportStatus[t] = 'pending';
+                  }
+                });
               });
             }),
         _SheetAction(icon: Icons.delete_outline, iconColor: const Color(0xFFF2554F),
@@ -1163,14 +2085,38 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
 
   /// Tries every field name the XLM-R backend might use.
   /// Add debugPrint('API: $data') in _scan() to discover the exact key.
-  String _extractLabelDetail(Map<String, dynamic> msg) {
+  List<Map<String, dynamic>> _extractLabelDetails(Map<String, dynamic> msg) {
     for (final key in ['sublabel', 'sub_label', 'type', 'category', 'subtype', 'phishing_type', 'attack_type']) {
       final v = (msg[key] ?? '').toString().trim();
-      if (v.isNotEmpty && v.toLowerCase() != 'unknown') return v;
+      if (v.isNotEmpty && v.toLowerCase() != 'unknown') {
+        return [{'label': v, 'icon': Icons.warning_amber_rounded}];
+      }
     }
-    final conf = msg['confidence'];
-    if (conf != null) return '${conf.toString()}% confidence';
-    return '';
+    final text = (msg['message'] ?? '').toString().toLowerCase();
+    final tags = <Map<String, dynamic>>[];
+    if (RegExp(r'https?://|bit\.ly|tinyurl|t\.co|click.*link|tap.*link|link.*below').hasMatch(text)) {
+      tags.add({'label': 'Suspicious URL', 'icon': Icons.link});
+    }
+    if (RegExp(r'prize|reward|won|winner|claim|free|gift|cash|piso|pesos|spins?|\d+\s*(pesos?|php|\$)').hasMatch(text)) {
+      tags.add({'label': 'Fake Rewards', 'icon': Icons.card_giftcard});
+    }
+    if (RegExp(r'login|log in|sign in|password|username|credentials|verif|otp|one.time|confirm|code|pin|passcode').hasMatch(text)) {
+      tags.add({'label': 'Sensitive info request', 'icon': Icons.key});
+    }
+    if (RegExp(r'bank|gcash|maya|paypal|credit|debit|transfer|withdraw|deposit').hasMatch(text)) {
+      tags.add({'label': 'Financial Fraud', 'icon': Icons.account_balance_wallet});
+    }
+    if (RegExp(r'parcel|package|deliver|shipment|courier|postal|tracking').hasMatch(text)) {
+      tags.add({'label': 'Fake Delivery', 'icon': Icons.local_shipping});
+    }
+    if (RegExp(r'sss|philhealth|pagibig|bir|lto|nbi|dfa|passport|clearance').hasMatch(text)) {
+      tags.add({'label': 'Gov. Impersonation', 'icon': Icons.account_balance});
+    }
+    if (RegExp(r'job|hiring|apply|salary|earn|work from home|income|negosyo').hasMatch(text)) {
+      tags.add({'label': 'Fake Job Offer', 'icon': Icons.work_outline});
+    }
+    if (tags.isNotEmpty) return tags;
+    return [{'label': 'Suspicious Message', 'icon': Icons.warning_amber_rounded}];
   }
 
   @override
@@ -1214,8 +2160,8 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             final time    = widget.formatTime(msg['time'] as String?);
             final isMatch = _query.isNotEmpty && matches.contains(i);
 
-            // Detail sub-line: specific phishing type from XLM-R model
-            final labelDetail = _extractLabelDetail(msg);
+            // Detail tags: specific phishing types from XLM-R model
+            final labelTags = _extractLabelDetails(msg);
 
             DateTime? msgDate; bool showDate = false;
             try {
@@ -1248,41 +2194,109 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                     _highlightText(message, _query),
                     const SizedBox(height: 10),
 
-                    // Verification replaces label — ONLY after Submit is tapped
-                    if (_senderReported) ...[
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF1A7A72).withOpacity(.08),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: const Color(0xFF1A7A72).withOpacity(.25))),
+                    // Status display per message
+                    Builder(builder: (_) {
+                      final msgTime   = msg['time']?.toString() ?? '';
+                      final msgStatus = _reportStatus[msgTime]; // null | 'pending' | 'verified' | 'rejected'
+
+                      if (msgStatus == 'verified' || msgStatus == 'rejected') {
+                        final isVerified = msgStatus == 'verified';
+                        final color      = isVerified ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+                        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          // Corrected label chip
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(color: isVerified ? const Color(0xFF06C85E) : const Color(0xFFF2554F), borderRadius: BorderRadius.circular(20)),
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(isVerified ? Icons.check_circle : Icons.warning_rounded, size: 13, color: Colors.white),
+                              const SizedBox(width: 5),
+                              Text(isVerified ? 'Safe' : 'Phishing Detected',
+                                  style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600)),
+                            ])),
+                          const SizedBox(height: 6),
+                          // Developer-reviewed banner (dismissible)
+                          if (!_dismissedNotes.contains(msgTime))
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
+                              decoration: BoxDecoration(
+                                color: color.withOpacity(.08),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: color.withOpacity(.30))),
+                              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                Icon(isVerified ? Icons.verified_outlined : Icons.cancel_outlined, size: 14, color: color),
+                                const SizedBox(width: 7),
+                                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                  Text(
+                                    isVerified ? 'Reviewed & Verified by Developers' : 'Reviewed & Rejected by Developers',
+                                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: color)),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    isVerified
+                                        ? 'Our team confirmed your report was accurate. This message has been reclassified as Safe and moved to your inbox.'
+                                        : 'Our team reviewed your report and confirmed this message is Phishing. It will remain in the Spam Folder.',
+                                    style: const TextStyle(fontSize: 11, color: Color(0xFF666666), height: 1.4)),
+                                ])),
+                                GestureDetector(
+                                  onTap: () async {
+                                    setState(() => _dismissedNotes.add(msgTime));
+                                    final p = await SharedPreferences.getInstance();
+                                    await p.setString(_dismissedNotesKey, jsonEncode(_dismissedNotes.toList()));
+                                  },
+                                  child: const Padding(
+                                    padding: EdgeInsets.only(left: 4),
+                                    child: Icon(Icons.close, size: 14, color: Color(0xFFAAAAAA)))),
+                              ])),
+                        ]);
+                      }
+
+                      if (msgStatus == 'pending') {
+                        return Align(
+                          alignment: Alignment.centerLeft,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1A7A72).withOpacity(.08),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: const Color(0xFF1A7A72).withOpacity(.25))),
+                            child: Row(mainAxisSize: MainAxisSize.min, children: const [
+                              Icon(Icons.hourglass_top_rounded, size: 14, color: Color(0xFF1A7A72)),
+                              SizedBox(width: 6),
+                              Text('Verification in Progress',
+                                  style: TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
+                            ])),
+                        );
+                      }
+
+                      // Default: Phishing label + sub-tags
+                      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(color: const Color(0xFFF2554F), borderRadius: BorderRadius.circular(20)),
                           child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                            Icon(Icons.hourglass_top_rounded, size: 14, color: Color(0xFF1A7A72)),
-                            SizedBox(width: 6),
-                            Text('Verification in Progress',
-                                style: TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
+                            Icon(Icons.warning_rounded, size: 13, color: Colors.white),
+                            SizedBox(width: 5),
+                            Text('Phishing Detected',
+                                style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600)),
                           ])),
-                      ),
-                    ] else ...[
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFF2554F),
-                          borderRadius: BorderRadius.circular(20)),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                          Icon(Icons.warning_rounded, size: 13, color: Colors.white),
-                          SizedBox(width: 5),
-                          Text('Phishing Detected',
-                              style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600)),
-                        ])),
-                      if (labelDetail.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4, left: 6),
-                          child: Text(labelDetail,
-                              style: TextStyle(fontSize: 11, color: const Color(0xFFF2554F).withOpacity(.85)))),
-                    ],
+                        if (labelTags.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Wrap(spacing: 6, runSpacing: 4,
+                              children: labelTags.map((tag) => Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: Colors.transparent,
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(color: const Color(0xFFF2554F).withOpacity(.55), width: 1)),
+                                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                  Icon(tag['icon'] as IconData, size: 11, color: const Color(0xFFF2554F)),
+                                  const SizedBox(width: 4),
+                                  Text(tag['label'] as String,
+                                      style: const TextStyle(fontSize: 11, color: Color(0xFFF2554F), fontWeight: FontWeight.w500)),
+                                ]))).toList())),
+                      ]);
+                    }),
 
                     const SizedBox(height: 8),
                     Align(alignment: Alignment.bottomRight,
@@ -1295,6 +2309,36 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
         ),
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firestore report helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+Future<void> _submitReport({
+  required String sender,
+  required String message,
+  required String originalLabel,
+  required String reason,
+  required String type,
+  required String deviceId,
+  String messageTime = '',
+}) async {
+  try {
+    await FirebaseFirestore.instance.collection('reports').add({
+      'sender'       : sender,
+      'message'      : message,
+      'originalLabel': originalLabel,
+      'reason'       : reason,
+      'type'         : type,
+      'status'       : 'pending',
+      'deviceId'     : deviceId,
+      'messageTime'  : messageTime,
+      'reportedAt'   : FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    debugPrint('Failed to submit report: $e');
   }
 }
 
@@ -1381,7 +2425,7 @@ class _ScanBottomSheetState extends State<_ScanBottomSheet> {
         const SizedBox(height: 4),
         const Text("Paste an SMS to check if it's safe or phishing.", style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
         const SizedBox(height: 16),
-        _field(_senderCtrl, hint: 'Sender name or number (optional)', icon: Icons.person_outline, maxLines: 1),
+        _field(_senderCtrl, hint: 'Sender name or number (optional)', icon: Icons.person, maxLines: 1),
         const SizedBox(height: 10),
         _field(_messageCtrl, hint: 'Paste the message here...', maxLines: 5, minLines: 3),
         const SizedBox(height: 12),

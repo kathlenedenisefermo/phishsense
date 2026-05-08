@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import onnxruntime as ort
 import numpy as np
@@ -8,6 +9,15 @@ from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
 
 app = FastAPI()
+
+# ── CORS — allows Flutter web (Chrome) to call this API ──────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Download model files from Hugging Face
 REPO_ID = "joaquinkriztel/phishsense-model"

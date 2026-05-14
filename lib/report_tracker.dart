@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
 import 'report_model.dart';
+import 'dart:async';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReportTrackerBody
@@ -18,14 +20,18 @@ import 'report_model.dart';
 
 class ReportTrackerBody extends StatefulWidget {
   final String deviceId;
-  final String source; // 'inbox' | 'spam'
+  final String source;
   final void Function(String sender, String messageId)? onOpenConversation;
+  final void Function(void Function())? onToggleHideReviewed;
+  final void Function(bool)? onHideReviewedChanged;
 
   const ReportTrackerBody({
     super.key,
     required this.deviceId,
     required this.source,
     this.onOpenConversation,
+    this.onToggleHideReviewed,
+    this.onHideReviewedChanged,
   });
 
   @override
@@ -35,6 +41,9 @@ class ReportTrackerBody extends StatefulWidget {
 class _ReportTrackerBodyState extends State<ReportTrackerBody> {
   final Map<String, ReportStatus> _prevStatus = {};
   final Set<String> _dialogShownThisSession = {};
+  final Set<String> _viewedReportIds = {};
+  static const _viewedKey = 'viewed_report_ids';
+  bool _hideReviewed = false;
 
   // Single merged stream — avoids nested StreamBuilders causing rapid
   // double-rebuilds that hit Flutter Web's canvas assertion.
@@ -49,26 +58,29 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
     super.initState();
     _mergedController = StreamController<_MergedDocs>.broadcast();
     if (widget.deviceId.isNotEmpty) _subscribeStreams();
+    _loadViewedIds();
+    widget.onToggleHideReviewed?.call(() {
+      setState(() => _hideReviewed = !_hideReviewed);
+      widget.onHideReviewedChanged?.call(_hideReviewed);
+    });
+  }
+
+  Future<void> _loadViewedIds() async {
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString(_viewedKey);
+    if (raw != null && raw.isNotEmpty) {
+      final list = (jsonDecode(raw) as List).cast<String>();
+      if (mounted) setState(() => _viewedReportIds.addAll(list));
+    }
   }
 
   void _subscribeStreams() {
-    final fs = FirebaseFirestore.instance;
-    _activeSub = fs
-        .collection('reports')
-        .where('deviceId', isEqualTo: widget.deviceId)
-        .where('source', isEqualTo: widget.source)
+    _activeSub = FirebaseFirestore.instance
+        .collection('model_feedback')
         .snapshots()
         .listen((snap) {
-      _activeDocs = snap.docs;
-      _emitMerged();
-    });
-    _reviewedSub = fs
-        .collection('reviewed')
-        .where('deviceId', isEqualTo: widget.deviceId)
-        .where('source', isEqualTo: widget.source)
-        .snapshots()
-        .listen((snap) {
-      _reviewedDocs = snap.docs;
+      _activeDocs  = snap.docs;
+      _reviewedDocs = [];
       _emitMerged();
     });
   }
@@ -91,17 +103,33 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
   Widget build(BuildContext context) {
     if (widget.deviceId.isEmpty) {
       return const Center(
-          child: CircularProgressIndicator(color: Color(0xFF1A7A72)));
+        child: Padding(
+          padding: EdgeInsets.all(32),
+          child: Text(
+            'No reports yet.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Color(0xFF888888), fontSize: 15, height: 1.6),
+          ),
+        ),
+      );
     }
     return StreamBuilder<_MergedDocs>(
       stream: _mergedController.stream,
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(
-              child: CircularProgressIndicator(color: Color(0xFF1A7A72)));
+            child: Padding(
+              padding: EdgeInsets.all(32),
+              child: Text(
+                'No reports yet.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFF888888), fontSize: 15, height: 1.6),
+              ),
+            ),
+          );
         }
 
-        const reviewedStatuses = {'verified', 'validated', 'rejected'};
+        const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
         final allDocs = <QueryDocumentSnapshot>[
           ...snap.data!.active,
           ...snap.data!.reviewed,
@@ -109,8 +137,8 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
 
         List<QueryDocumentSnapshot> sortByDate(List<QueryDocumentSnapshot> docs) =>
             docs..sort((a, b) {
-              final aT = (a.data() as Map<String, dynamic>)['reportedAt'] as Timestamp?;
-              final bT = (b.data() as Map<String, dynamic>)['reportedAt'] as Timestamp?;
+              final aT = (a.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
+              final bT = (b.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
               if (aT == null && bT == null) return 0;
               if (aT == null) return 1;
               if (bT == null) return -1;
@@ -142,16 +170,24 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
 
         final pending = pendingDocs.map((d) => ReportModel.fromFirestore(d)).toList();
         final decided = decidedDocs.map((d) => ReportModel.fromFirestore(d)).toList();
+
         final unseenReports = [
-          ...pending.where((r) => r.hasUnseenReview),
-          ...decided.where((r) => r.hasUnseenReview),
+          ...pending.where((r) =>
+          (r.status == ReportStatus.validated || r.status == ReportStatus.rejected) &&
+              !_viewedReportIds.contains(r.reportId)),
+          ...decided.where((r) =>
+          (r.status == ReportStatus.validated || r.status == ReportStatus.rejected) &&
+              !_viewedReportIds.contains(r.reportId)),
         ];
         final unseenCount = unseenReports.length;
 
+        final visibleDecided = _hideReviewed
+            ? decided.where((r) => !_viewedReportIds.contains(r.reportId)).toList()
+            : decided;
+
         final items = <Object>[
           ...pending,
-          if (decided.isNotEmpty) const _SectionDivider(label: 'Reviewed'),
-          ...decided,
+          ...visibleDecided,
         ];
 
         return ListView.builder(
@@ -159,28 +195,11 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
           itemCount: items.length,
           itemBuilder: (ctx, i) {
             final item = items[i];
-            if (item is _SectionDivider) {
-              return Padding(
-                padding: const EdgeInsets.fromLTRB(0, 8, 0, 12),
-                child: Row(children: [
-                  const Expanded(child: Divider(color: Color(0xFFDDD8CE))),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text(
-                      item.label,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: Color(0xFF999999),
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ),
-                  const Expanded(child: Divider(color: Color(0xFFDDD8CE))),
-                ]),
-              );
-            }
+            if (item is _SectionDivider) return const SizedBox.shrink();
             final report = item as ReportModel;
+            final isNew = (report.status == ReportStatus.validated ||
+                report.status == ReportStatus.rejected) &&
+                !_viewedReportIds.contains(report.reportId);
             final unseenIndex = unseenReports.indexOf(report);
             final unseenPosition = unseenIndex == -1 ? null : unseenIndex + 1;
             return Padding(
@@ -189,8 +208,41 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
                 report: report,
                 unseenPosition: unseenPosition,
                 unseenCount: unseenCount,
-                isNew: report.hasUnseenReview,
-                onTap: () => _handleTrackerItemTap(report, unseenReports),
+                isNew: isNew,
+                onTap: () => _handleTrackerItemTap(report, unseenReports, isNew: isNew),
+                onDelete: (reportId) async {
+                  final doc = await FirebaseFirestore.instance
+                      .collection('model_feedback')
+                      .doc(reportId)
+                      .get();
+                  if (doc.exists) {
+                    final data = doc.data() as Map<String, dynamic>;
+                    final messageId = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+                    final sender    = (data['sender'] ?? '').toString();
+                    await FirebaseFirestore.instance
+                        .collection('model_feedback')
+                        .doc(reportId)
+                        .delete();
+                    if (messageId.isNotEmpty) {
+                      final p = await SharedPreferences.getInstance();
+                      final inboxKey = 'report_status_${sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+                      final inboxRaw = p.getString(inboxKey);
+                      if (inboxRaw != null && inboxRaw.isNotEmpty) {
+                        final map = (jsonDecode(inboxRaw) as Map).cast<String, String>();
+                        map.remove(messageId);
+                        await p.setString(inboxKey, jsonEncode(map));
+                      }
+                      final spamKey = 'spam_report_status_${sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
+                      final spamRaw = p.getString(spamKey);
+                      if (spamRaw != null && spamRaw.isNotEmpty) {
+                        final map = (jsonDecode(spamRaw) as Map).cast<String, String>();
+                        map.remove(messageId);
+                        await p.setString(spamKey, jsonEncode(map));
+                      }
+                    }
+                  }
+                },
+                onMarkUnseen: () => _markReportUnseen(report.reportId),
               ),
             );
           },
@@ -203,43 +255,18 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
 
   void _handleTrackerItemTap(
       ReportModel report,
-      List<ReportModel> unseenReports,
-      ) async {
-    if (widget.onOpenConversation != null) {
-      widget.onOpenConversation!(report.sender, report.messageId);
+      List<ReportModel> unseenReports, {
+        bool isNew = false,
+      }) {
+    if (report.message.isNotEmpty) {
+      widget.onOpenConversation?.call('', report.message);
     }
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (!mounted) return;
-
-    if (report.hasUnseenReview) {
-      if (!_dialogShownThisSession.contains(report.reportId)) {
-        _dialogShownThisSession.add(report.reportId);
-        try {
-          final firestore = FirebaseFirestore.instance;
-          final results = await Future.wait([
-            firestore
-                .collection('reports')
-                .where('deviceId', isEqualTo: widget.deviceId)
-                .where('isViewed', isEqualTo: false)
-                .get(),
-            firestore
-                .collection('reviewed')
-                .where('deviceId', isEqualTo: widget.deviceId)
-                .where('isViewed', isEqualTo: false)
-                .get(),
-          ]);
-          final allUnseen = [
-            ...results[0].docs,
-            ...results[1].docs,
-          ]
-              .map((d) => ReportModel.fromFirestore(d))
-              .where((r) => r.hasUnseenReview)
-              .toList();
-          if (mounted) _showReviewDialog(context, report, allUnseen.isNotEmpty ? allUnseen : unseenReports);
-        } catch (_) {
-          if (mounted) _showReviewDialog(context, report, unseenReports);
-        }
-      }
+    if (isNew && !_dialogShownThisSession.contains(report.reportId)) {
+      _dialogShownThisSession.add(report.reportId);
+      Future.delayed(const Duration(milliseconds: 400), () {
+        if (!mounted) return;
+        _showReviewDialog(context, report, unseenReports);
+      });
     }
   }
 
@@ -584,79 +611,17 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
   // It does NOT touch labels or status — those are admin-only fields.
 
   Future<void> _markReportViewed(String reportId, {ReportModel? report}) async {
-    try {
-      final firestore = FirebaseFirestore.instance;
-      final reportRef   = firestore.collection('reports').doc(reportId);
-      final reviewedRef = firestore.collection('reviewed').doc(reportId);
-
-      // Resolve new label and derive which tab the report now belongs in.
-      // Phishing → spam tab, Safe → inbox tab. Only update source when the
-      // label actually flips (verified decision); rejected keeps original source.
-      final update = <String, dynamic>{'isViewed': true};
-      if (report != null) {
-        final newLabel = resolveLabel(report);
-        if (newLabel == 'Phishing') update['source'] = 'spam';
-        else if (newLabel == 'Safe') update['source'] = 'inbox';
-      }
-
-      final snap = await reportRef.get();
-      if (snap.exists) {
-        await reportRef.update(update);
-      } else {
-        await reviewedRef.update(update);
-      }
-
-      if (report != null) {
-        final newLabel = resolveLabel(report);
-        if (newLabel.isNotEmpty && report.messageId.isNotEmpty) {
-          await _applyLabelLocally(
-            messageId: report.messageId,
-            newLabel: newLabel,
-          );
-        }
-      }
-    } catch (e) {
-      debugPrint('Failed to mark report viewed: $e');
-    }
+    final p = await SharedPreferences.getInstance();
+    _viewedReportIds.add(reportId);
+    await p.setString(_viewedKey, jsonEncode(_viewedReportIds.toList()));
+    if (mounted) setState(() {});
   }
 
-  Future<void> _applyLabelLocally({
-    required String messageId,
-    required String newLabel,
-  }) async {
-    try {
-      final p = await SharedPreferences.getInstance();
-      const manualKey = 'manual_scan_logs';
-      const spamKey = 'spam_folder_logs';
-
-      final manRaw = p.getString(manualKey);
-      if (manRaw != null && manRaw.isNotEmpty) {
-        final man = (jsonDecode(manRaw) as List).cast<Map<String, dynamic>>();
-        bool changed = false;
-        for (final m in man) {
-          if (m['time']?.toString() == messageId) {
-            m['label'] = newLabel;
-            changed = true;
-          }
-        }
-        if (changed) await p.setString(manualKey, jsonEncode(man));
-      }
-
-      final spamRaw = p.getString(spamKey);
-      if (spamRaw != null && spamRaw.isNotEmpty) {
-        final spam = (jsonDecode(spamRaw) as List).cast<Map<String, dynamic>>();
-        bool changed = false;
-        for (final m in spam) {
-          if (m['time']?.toString() == messageId) {
-            m['label'] = newLabel;
-            changed = true;
-          }
-        }
-        if (changed) await p.setString(spamKey, jsonEncode(spam));
-      }
-    } catch (e) {
-      debugPrint('Failed to apply label locally: $e');
-    }
+  Future<void> _markReportUnseen(String reportId) async {
+    final p = await SharedPreferences.getInstance();
+    _viewedReportIds.remove(reportId);
+    await p.setString(_viewedKey, jsonEncode(_viewedReportIds.toList()));
+    if (mounted) setState(() {});
   }
 }
 
@@ -683,12 +648,14 @@ class _SectionDivider {
 // _ReportTrackerCard — individual card in the tracker list
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _ReportTrackerCard extends StatelessWidget {
+class _ReportTrackerCard extends StatefulWidget {
   final ReportModel report;
   final int? unseenPosition;
   final int unseenCount;
   final bool isNew;
   final VoidCallback onTap;
+  final Future<void> Function(String reportId)? onDelete;
+  final VoidCallback? onMarkUnseen;
 
   const _ReportTrackerCard({
     required this.report,
@@ -696,60 +663,230 @@ class _ReportTrackerCard extends StatelessWidget {
     required this.unseenCount,
     required this.isNew,
     required this.onTap,
+    this.onDelete,
+    this.onMarkUnseen,
   });
 
   @override
-  Widget build(BuildContext context) {
-    final isUnderReview = report.status == ReportStatus.underReview;
-    final isValidated   = report.status == ReportStatus.validated;
-    final hasUnseen     = isNew;
+  State<_ReportTrackerCard> createState() => _ReportTrackerCardState();
+}
 
-    // Report type label chip color
-    final reportType        = report.reportType;
-    final isPhishingReport  = reportType == ReportType.phishing;
-    final chipColor         = isPhishingReport
+class _ReportTrackerCardState extends State<_ReportTrackerCard> {
+  late Timer _timer;
+  late String _formattedDate;
+
+  String _buildDate() {
+    final now = DateTime.now();
+    final dt  = widget.report.reportedAt.toLocal();
+    final diff = now.difference(dt);
+    if (diff.inDays == 0) return 'Today, ${DateFormat('h:mm a').format(dt)}';
+    if (diff.inDays == 1) return 'Yesterday, ${DateFormat('h:mm a').format(dt)}';
+    return DateFormat('MMM d, h:mm a').format(dt);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _formattedDate = _buildDate();
+    _timer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() => _formattedDate = _buildDate());
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    super.dispose();
+  }
+
+  Future<void> _confirmDelete(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF6F4EC),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: Row(children: const [
+          Icon(Icons.delete_outline, color: Color(0xFFF2554F), size: 22),
+          SizedBox(width: 10),
+          Text('Retract Report',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
+        ]),
+        content: const Text(
+          'Are you sure you want to retract this report? It will be removed from your report history.',
+          style: TextStyle(fontSize: 14, color: Color(0xFF555555), height: 1.5),
+        ),
+        actionsPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel',
+                style: TextStyle(color: Color(0xFF888888))),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFF2554F),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            child: const Text('Retract'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await widget.onDelete?.call(widget.report.reportId);
+    }
+  }
+
+  void _showLongPressSheet(BuildContext context) {
+    final isUnderReview = widget.report.status == ReportStatus.underReview;
+    final isReviewed    = !isUnderReview;
+    final isAlreadySeen = !widget.isNew;
+
+    // Only show sheet if under review OR (reviewed and already seen)
+    if (isUnderReview) {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: Colors.transparent,
+        useRootNavigator: true,
+        useSafeArea: false,
+        builder: (_) => Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.only(
+              topLeft: Radius.circular(24),
+              topRight: Radius.circular(24),
+            ),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 40, height: 4,
+              margin: const EdgeInsets.symmetric(vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFCCCCC0),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            InkWell(
+              onTap: () {
+                Navigator.pop(context);
+                _confirmDelete(context);
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                child: Row(children: [
+                  Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF2554F).withOpacity(.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.delete_outline,
+                        color: Color(0xFFF2554F), size: 20),
+                  ),
+                  const SizedBox(width: 16),
+                  const Text('Retract report',
+                      style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: Color(0xFFF2554F))),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ]),
+        ),
+      );
+    } else if (isReviewed && isAlreadySeen) {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: Colors.transparent,
+        useRootNavigator: true,
+        useSafeArea: false,
+        builder: (_) => Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.only(
+              topLeft: Radius.circular(24),
+              topRight: Radius.circular(24),
+            ),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 40, height: 4,
+              margin: const EdgeInsets.symmetric(vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFCCCCC0),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            InkWell(
+              onTap: () {
+                Navigator.pop(context);
+                widget.onMarkUnseen?.call();
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                child: Row(children: [
+                  Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A7A72).withOpacity(.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.mark_email_unread_outlined,
+                        color: Color(0xFF1A7A72), size: 20),
+                  ),
+                  const SizedBox(width: 16),
+                  const Text('Mark as unseen',
+                      style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: Colors.black87)),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ]),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isUnderReview = widget.report.status == ReportStatus.underReview;
+    final isValidated   = widget.report.status == ReportStatus.validated;
+    final hasUnseen     = widget.isNew;
+
+    final reportType       = widget.report.reportType;
+    final isPhishingReport = reportType == ReportType.phishing;
+    final chipColor        = isPhishingReport
         ? const Color(0xFF1A7A72)
         : const Color(0xFFF2554F);
-    final chipLabel         = isPhishingReport ? 'Safe Report' : 'Phishing Report';
+    final chipLabel = isPhishingReport ? 'Safe Report' : 'Phishing Report';
 
-    // Status
     final statusIcon = isUnderReview
         ? Icons.hourglass_bottom_rounded
         : isValidated
-          ? Icons.verified_rounded
-          : Icons.cancel_outlined;
-      final statusLabel = isUnderReview
+        ? Icons.verified_rounded
+        : Icons.cancel_outlined;
+    final statusLabel = isUnderReview
         ? 'Under Review'
         : isValidated
-          ? 'Verified'
-          : 'Rejected';
+        ? 'Verified'
+        : 'Rejected';
     final statusColor = isUnderReview
         ? const Color(0xFF888888)
         : isValidated
-          ? const Color(0xFF1A7A72)
-          : const Color(0xFFF2554F);
-
-    // Date
-    final formattedDate = report.reviewedAt != null
-        ? (() {
-      final now = DateTime.now();
-      final dt  = report.reportedAt.toLocal();
-      final diff = now.difference(dt);
-      if (diff.inDays == 0) return 'Today, ${DateFormat('h:mm a').format(dt)}';
-      if (diff.inDays == 1) return 'Yesterday, ${DateFormat('h:mm a').format(dt)}';
-      return DateFormat('MMM d, h:mm a').format(dt);
-    })()
-        : (() {
-      final now  = DateTime.now();
-      final dt   = report.reportedAt.toLocal();
-      final diff = now.difference(dt);
-      if (diff.inDays == 0) return 'Today, ${DateFormat('h:mm a').format(dt)}';
-      if (diff.inDays == 1) return 'Yesterday, ${DateFormat('h:mm a').format(dt)}';
-      return DateFormat('MMM d, h:mm a').format(dt);
-    })();
+        ? const Color(0xFF1A7A72)
+        : const Color(0xFFF2554F);
 
     return GestureDetector(
-      onTap: onTap,
+      onTap: widget.onTap,
+      onLongPress: () => _showLongPressSheet(context),
       behavior: HitTestBehavior.opaque,
       child: Container(
         decoration: BoxDecoration(
@@ -766,12 +903,13 @@ class _ReportTrackerCard extends StatelessWidget {
         ),
         child: Padding(
           padding: const EdgeInsets.all(16),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-
-            // ── Top row: report type chip + NEW badge + date ──────────────
+          child:
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            // ── Top row: chip + NEW badge + date + delete ─────────────────
             Row(children: [
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                padding:
+                const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 decoration: BoxDecoration(
                   color: chipColor.withOpacity(.12),
                   borderRadius: BorderRadius.circular(20),
@@ -787,38 +925,63 @@ class _ReportTrackerCard extends StatelessWidget {
               if (hasUnseen) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1A7A72).withOpacity(.75),
-                    borderRadius: BorderRadius.circular(10),
+                    color: const Color(0xFF1A5C56),
+                    borderRadius: BorderRadius.circular(20),
                   ),
-                  child: Text(
-                    'NEW',
-                    style: const TextStyle(
-                        fontSize: 10,
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: const BoxDecoration(
                         color: Colors.white,
-                        fontWeight: FontWeight.w700),
-                  ),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    const Text(
+                      'New',
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700),
+                    ),
+                  ]),
                 ),
               ],
               const Spacer(),
+              // ── Real-time date + delete button ────────────────────────
               Text(
-                formattedDate,
+                _formattedDate,
                 style: const TextStyle(fontSize: 12, color: Color(0xFF999999)),
               ),
+              if (widget.onDelete != null) ...[
+                const SizedBox(width: 4),
+                GestureDetector(
+                  onTap: () => _confirmDelete(context),
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    child: const Icon(
+                      Icons.delete_outline,
+                      size: 17,
+                      color: Color(0xFFCCCCCC),
+                    ),
+                  ),
+                ),
+              ],
             ]),
 
             const SizedBox(height: 12),
 
             // ── Message text ──────────────────────────────────────────────
             Text(
-              report.message.length > 120
-                  ? '${report.message.substring(0, 120)}…'
-                  : report.message,
+              widget.report.message.length > 120
+                  ? '${widget.report.message.substring(0, 120)}…'
+                  : widget.report.message,
               style: const TextStyle(
-                  fontSize: 15,
-                  color: Colors.black87,
-                  height: 1.4),
+                  fontSize: 15, color: Colors.black87, height: 1.4),
             ),
 
             const SizedBox(height: 6),
@@ -830,7 +993,9 @@ class _ReportTrackerCard extends StatelessWidget {
               const SizedBox(width: 4),
               Expanded(
                 child: Text(
-                  report.reason.isEmpty ? 'No reason provided' : report.reason,
+                  widget.report.reason.isEmpty
+                      ? 'No reason provided'
+                      : widget.report.reason,
                   style: const TextStyle(
                       fontSize: 13,
                       color: Color(0xFF888888),
@@ -845,43 +1010,51 @@ class _ReportTrackerCard extends StatelessWidget {
             const Divider(height: 1, color: Color(0xFFEEEBE0)),
             const SizedBox(height: 10),
 
-            // ── Status row ────────────────────────────────────────────────
-            Row(children: [
-              Icon(statusIcon, size: 15, color: statusColor),
-              const SizedBox(width: 6),
-              Text(
-                statusLabel,
-                style: TextStyle(
-                    fontSize: 13,
-                    color: statusColor,
-                    fontWeight: FontWeight.w600),
+            // ── Status pill ───────────────────────────────────────────────
+            Container(
+              padding:
+              const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                border:
+                Border.all(color: statusColor.withOpacity(.5)),
+                borderRadius: BorderRadius.circular(20),
               ),
-              const Spacer(),
-              if (isUnderReview)
-                const Text(
-                  'Waiting for team validation',
-                  style: TextStyle(fontSize: 12, color: Color(0xFF999999)),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(statusIcon, size: 13, color: statusColor),
+                const SizedBox(width: 5),
+                Text(
+                  statusLabel,
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: statusColor,
+                      fontWeight: FontWeight.w600),
                 ),
-              if (!isUnderReview && report.reviewedLabel != null)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: report.reviewedLabel!.toLowerCase() == 'phishing'
-                        ? const Color(0xFFF2554F)
-                        : const Color(0xFF1A7A72),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Text(
-                    report.reviewedLabel!.toLowerCase() == 'phishing'
-                        ? 'Phishing'
-                        : 'Safe',
-                    style: const TextStyle(
-                        fontSize: 11,
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600),
-                  ),
-                ),
-            ]),
+              ]),
+            ),
+
+            const SizedBox(height: 6),
+
+            if (isUnderReview)
+              const Text('Waiting for team validation',
+                  style:
+                  TextStyle(fontSize: 13, color: Color(0xFF888888))),
+            if (!isUnderReview)
+              (() {
+                final isPhishingReport =
+                    widget.report.reportType == ReportType.phishing;
+                final actionLabel = isPhishingReport
+                    ? (isValidated
+                    ? 'Label updated to Safe.'
+                    : 'Label remains Phishing.')
+                    : (isValidated
+                    ? 'Label updated to Phishing.'
+                    : 'Label remains Safe.');
+                return Text(actionLabel,
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: statusColor,
+                        fontWeight: FontWeight.w500));
+              })(),
           ]),
         ),
       ),
@@ -931,116 +1104,41 @@ class ReportTrackerPage extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 
 Future<void> submitReport({
-  required String sender,
-  required String message,
-  required String messageId,   // use message['time'] as the unique id
-  required String reportType,  // 'phishing' | 'safe'
+  required String messageBody,
+  required String originalLabel,
+  required double confidence,
   required String reason,
-  required String source,      // 'inbox' | 'spam'
-  required String deviceId,
+
+  // These are accepted but intentionally ignored
+  // so old and new documents stay consistent
+  String deviceId  = '',
+  String sender    = '',
+  String messageId = '',
+  String source    = 'inbox',
 }) async {
   try {
-    await FirebaseFirestore.instance.collection('reports').add({
-      'sender': sender,
-      'message': message,
-      'messageId': messageId,
-      'reportType': reportType,
-      'reason': reason,
-      'source': source,
-      'deviceId': deviceId,
-      // Admin-set fields — initialised to null/defaults
-      'status': 'under_review',
-      'decision': null,
-      'reviewedLabel': null,
-      'reviewedAt': null,
-      // User view state
-      'isViewed': false,
-      'reportedAt': FieldValue.serverTimestamp(),
+    final correctedLabel = originalLabel.toLowerCase() == 'phishing'
+        ? 'legitimate'
+        : 'phishing';
+
+    final messageHash = sha256
+        .convert(utf8.encode(messageBody))
+        .toString();
+
+    await FirebaseFirestore.instance
+        .collection('model_feedback')
+        .add({
+      'confidence'    : confidence,
+      'correctedLabel': correctedLabel,
+      'messageBody'   : messageBody,
+      'messageHash'   : messageHash,
+      'originalLabel' : originalLabel,
+      'reason'        : reason,
+      'status'        : 'pending',
+      'timestamp'     : FieldValue.serverTimestamp(),
+      'type'          : 'inaccurate_report',
     });
   } catch (e) {
     debugPrint('submitReport failed: $e');
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// updateReportStatus — updates a report's status and moves it to the
-// `reviewed` collection when the status is verified, validated, or rejected.
-// ─────────────────────────────────────────────────────────────────────────────
-
-Future<void> updateReportStatus({
-  required String reportId,
-  required String newStatus,
-}) async {
-  try {
-    final firestore = FirebaseFirestore.instance;
-    final reportRef = firestore.collection('reports').doc(reportId);
-    final snap = await reportRef.get();
-    if (!snap.exists) return;
-
-    final data = Map<String, dynamic>.from(snap.data()!);
-    data['status'] = newStatus;
-    data['reviewedAt'] = Timestamp.now();
-
-    const reviewedStatuses = ['verified', 'validated', 'rejected'];
-    if (reviewedStatuses.contains(newStatus)) {
-      data['movedToReviewedAt'] = Timestamp.now();
-      await firestore.collection('reviewed').doc(reportId).set(data);
-      await reportRef.delete();
-    } else {
-      await reportRef.update({
-        'status': newStatus,
-        'reviewedAt': Timestamp.now(),
-      });
-    }
-  } catch (e) {
-    debugPrint('updateReportStatus failed: $e');
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// applyFirebaseLabel — reads the latest reviewed label for a messageId
-// from Firestore and applies it to local SharedPreferences storage.
-//
-// Call this from your global listener in IOSMessagesPage when a report
-// transitions to validated or rejected.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Label update logic — pure function, no side effects.
-// Given a report, returns the label the message should now display.
-String resolveLabel(ReportModel report) {
-  // While under review:
-  // DO NOT change the label yet.
-  // Caller should continue using the existing/current message label.
-  if (report.status == ReportStatus.underReview) {
-    return '';
-  }
-
-
-  final reportedPhishing =
-      report.reportType == ReportType.phishing;
-
-  final validated =
-      report.status == ReportStatus.validated;
-
-  // CASE 1:
-  // Safe message reported as phishing
-  //
-  // validated -> phishing
-  // rejected  -> safe
-
-  // CASE 2:
-  // Phishing message reported as safe
-  //
-  // validated -> safe
-  // rejected  -> phishing
-
-  if (reportedPhishing) {
-    // User reported as phishing (original label was Safe)
-    // verified → Phishing confirmed   rejected → stays Safe
-    return validated ? 'Phishing' : 'Safe';
-  } else {
-    // User reported as safe (original label was Phishing)
-    // verified → Safe confirmed   rejected → stays Phishing
-    return validated ? 'Safe' : 'Phishing';
   }
 }

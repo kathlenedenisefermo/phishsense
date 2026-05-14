@@ -1,60 +1,60 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ReportModel — single source of truth from Firestore
-// ─────────────────────────────────────────────────────────────────────────────
-
 enum ReportStatus { underReview, validated, rejected }
 
 enum ReportType { phishing, safe }
 
 class ReportModel {
   final String reportId;
-  final String messageId;   // matches message['time'] used as unique key
-  final String deviceId;
-  final String sender;
   final String message;
-  final ReportType reportType;       // what the user claimed
-  final ReportStatus status;
-  final String? decision;            // 'validated' | 'rejected' — set by admin
-  final String? reviewedLabel;       // 'safe' | 'phishing' — final label from admin
-  final DateTime? reviewedAt;
-  final bool isViewed;               // user has pressed "Got it"
-  final DateTime reportedAt;
-  final String source;               // 'inbox' | 'spam'
+  final String originalLabel;
+  final String correctedLabel;
+  final double confidence;
   final String reason;
+  final ReportStatus status;
+  final DateTime reportedAt;
+  final String type;
 
   const ReportModel({
     required this.reportId,
-    required this.messageId,
-    required this.deviceId,
-    required this.sender,
     required this.message,
-    required this.reportType,
-    required this.status,
-    this.decision,
-    this.reviewedLabel,
-    this.reviewedAt,
-    required this.isViewed,
-    required this.reportedAt,
-    required this.source,
+    required this.originalLabel,
+    required this.correctedLabel,
+    required this.confidence,
     required this.reason,
+    required this.status,
+    required this.reportedAt,
+    required this.type,
   });
 
-  /// Whether this report has been reviewed and the user hasn't seen the result yet.
-  bool get hasUnseenReview =>
-      (status == ReportStatus.validated || status == ReportStatus.rejected) &&
-          !isViewed;
+  // Derived getters — computed from the 9 fields
+  String get messageId => '';
+  String get deviceId  => '';
+  String get sender    => 'Unknown';
+  String get source    => 'inbox';
+  bool   get isViewed  => false;
+  DateTime? get reviewedAt => null;
+  String? get decision => null;
 
-  /// Human-readable status label for the tracker UI.
+  ReportType get reportType =>
+      correctedLabel == 'phishing' ? ReportType.phishing : ReportType.safe;
+
+  String? get reviewedLabel {
+    if (status == ReportStatus.underReview) return null;
+    final wasPhishing = originalLabel.toLowerCase() == 'phishing';
+    final validated   = status == ReportStatus.validated;
+    if (wasPhishing) return validated ? 'Safe'     : 'Phishing';
+    else             return validated ? 'Phishing' : 'Safe';
+  }
+
+  bool get hasUnseenReview =>
+      status == ReportStatus.validated || status == ReportStatus.rejected;
+
   String get statusLabel {
     switch (status) {
-      case ReportStatus.underReview:
-        return 'Under Review';
-      case ReportStatus.validated:
-        return 'Verified';
-      case ReportStatus.rejected:
-        return 'Rejected';
+      case ReportStatus.underReview: return 'Under Review';
+      case ReportStatus.validated:   return 'Verified';
+      case ReportStatus.rejected:    return 'Rejected';
     }
   }
 
@@ -63,55 +63,24 @@ class ReportModel {
 
     ReportStatus parseStatus(String? s) {
       switch (s) {
+        case 'trained':
         case 'verified':
-        case 'validated':
-          return ReportStatus.validated;
-        case 'rejected':
-          return ReportStatus.rejected;
-        default:
-          return ReportStatus.underReview;
+        case 'validated': return ReportStatus.validated;
+        case 'rejected':  return ReportStatus.rejected;
+        default:          return ReportStatus.underReview;
       }
     }
 
-    ReportType parseType(String? t) {
-      return t == 'safe' ? ReportType.safe : ReportType.phishing;
-    }
-
     return ReportModel(
-      reportId: doc.id,
-      messageId: d['messageId'] as String? ?? '',
-      deviceId: d['deviceId'] as String? ?? '',
-      sender: d['sender'] as String? ?? 'Unknown',
-      message: d['message'] as String? ?? '',
-      reportType: parseType(d['reportType'] as String?),
-      status: parseStatus(d['status'] as String?),
-      decision: d['decision'] as String?,
-      reviewedLabel: d['reviewedLabel'] as String?,
-      reviewedAt: (d['reviewedAt'] as Timestamp?)?.toDate(),
-      isViewed: d['isViewed'] as bool? ?? false,
-      reportedAt: (d['reportedAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
-      source: d['source'] as String? ?? 'inbox',
-      reason: d['reason'] as String? ?? '',
+      reportId      : doc.id,
+      message       : d['messageBody'] as String? ?? '',
+      originalLabel : d['originalLabel'] as String? ?? '',
+      correctedLabel: d['correctedLabel'] as String? ?? '',
+      confidence    : (d['confidence'] as num?)?.toDouble() ?? 0.0,
+      reason        : d['reason'] as String? ?? '',
+      status        : parseStatus(d['status'] as String?),
+      reportedAt    : (d['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      type          : d['type'] as String? ?? 'inaccurate_report',
     );
   }
-
-  Map<String, dynamic> toFirestore() => {
-    'messageId': messageId,
-    'deviceId': deviceId,
-    'sender': sender,
-    'message': message,
-    'reportType': reportType == ReportType.phishing ? 'phishing' : 'safe',
-    'status': status == ReportStatus.underReview
-        ? 'under_review'
-        : status == ReportStatus.validated
-        ? 'validated'
-        : 'rejected',
-    'decision': decision,
-    'reviewedLabel': reviewedLabel,
-    'reviewedAt': reviewedAt != null ? Timestamp.fromDate(reviewedAt!) : null,
-    'isViewed': isViewed,
-    'reportedAt': Timestamp.fromDate(reportedAt),
-    'source': source,
-    'reason': reason,
-  };
 }

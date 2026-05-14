@@ -1,3 +1,5 @@
+import 'report_tracker.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH: Replace the SpamFolderPage StatefulWidget + State class in
 //        ios_messages_page.dart with this version.
@@ -428,15 +430,11 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                           _showVerificationDialog(ctx);
                           final msgs = _spamMessages.where((m) => (m['sender'] ?? '') == sender).toList();
                           final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
-                          _submitReport(
-                            sender: sender,
-                            message: sample['message']?.toString() ?? '',
-                            originalLabel: 'Phishing',
+                          submitReport(
+                            messageBody: sample['message']?.toString() ?? '',
+                            originalLabel: 'phishing',
+                            confidence: ((sample['confidence'] as num?)?.toDouble() ?? 0.0),
                             reason: selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
-                            type: 'inaccurate_detection',
-                            source: 'spam',
-                            deviceId: widget.deviceId,
-                            messageTime: sample['time']?.toString() ?? '',
                           );
                         },
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF2554F), foregroundColor: Colors.white,
@@ -455,6 +453,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
         return Dialog(
           backgroundColor: Colors.transparent,
           child: Container(
+            constraints: const BoxConstraints(minHeight: 420),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24),
               boxShadow: [BoxShadow(color: Colors.black.withOpacity(.12), blurRadius: 20, offset: const Offset(0, 6))],
             ),

@@ -493,28 +493,31 @@ class _ConversationPageState extends State<ConversationPage> {
     );
   }
 
-  Widget _buildIndicatorChip(PhishingIndicator indicator) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: indicator.color.withOpacity(0.10),
-        borderRadius: BorderRadius.circular(5),
-        border: Border.all(color: indicator.color.withOpacity(0.35), width: 0.8),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(indicator.icon, size: 9, color: indicator.color),
-          const SizedBox(width: 3),
-          Text(
-            indicator.label,
-            style: TextStyle(
-              fontSize: 9,
-              color: indicator.color,
-              fontWeight: FontWeight.w600,
+  Widget _buildIndicatorChip(SmsMessage msg, PhishingIndicator indicator) {
+    return GestureDetector(
+      onTap: () => _showReportDialog(msg),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: indicator.color.withOpacity(0.10),
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(color: indicator.color.withOpacity(0.35), width: 0.8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(indicator.icon, size: 9, color: indicator.color),
+            const SizedBox(width: 3),
+            Text(
+              indicator.label,
+              style: TextStyle(
+                fontSize: 9,
+                color: indicator.color,
+                fontWeight: FontWeight.w600,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -589,7 +592,7 @@ class _ConversationPageState extends State<ConversationPage> {
           Wrap(
             spacing: 4,
             runSpacing: 3,
-            children: indicators.map(_buildIndicatorChip).toList(),
+            children: indicators.map((ind) => _buildIndicatorChip(msg, ind)).toList(),
           ),
         ],
       );
@@ -804,81 +807,94 @@ class _ConversationPageState extends State<ConversationPage> {
 
     showDialog(
       context: context,
+      barrierColor: Colors.black.withOpacity(.35),
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) {
           final isOther = selected == 'Other reason';
           final canSubmit = selected != null && (!isOther || otherCtrl.text.trim().isNotEmpty);
-          return AlertDialog(
-            title: const Text(
-              'Report Inaccurate Detection',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
-            content: SingleChildScrollView(
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(28, 32, 28, 20),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Why do you think this detection is wrong?',
-                    style: TextStyle(fontSize: 13, color: Color(0xFF555555)),
-                  ),
-                  const SizedBox(height: 8),
-                  ...reasons.map(
-                    (r) => RadioListTile<String>(
-                      value: r,
-                      groupValue: selected,
-                      title: Text(r, style: const TextStyle(fontSize: 13)),
-                      onChanged: (v) => setDialogState(() => selected = v),
-                      activeColor: const Color(0xFF1A7A72),
-                      contentPadding: EdgeInsets.zero,
-                      dense: true,
+                  const Text('Report Inaccurate Detection',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.black87)),
+                  const SizedBox(height: 10),
+                  const Text('Why do you think this detection is wrong?',
+                      style: TextStyle(fontSize: 14, color: Color(0xFF888888))),
+                  const SizedBox(height: 16),
+                  ...reasons.map((r) => InkWell(
+                    onTap: () => setDialogState(() => selected = r),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      child: Row(children: [
+                        SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: Radio<String>(
+                            value: r,
+                            groupValue: selected,
+                            onChanged: (v) => setDialogState(() => selected = v),
+                            activeColor: const Color(0xFF1A7A72),
+                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(child: Text(r, style: const TextStyle(fontSize: 16, color: Colors.black87))),
+                      ]),
                     ),
-                  ),
+                  )),
                   if (isOther) ...[
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 4),
                     TextField(
                       controller: otherCtrl,
                       autofocus: true,
                       maxLines: 3,
+                      style: const TextStyle(fontSize: 14),
+                      onChanged: (_) => setDialogState(() {}),
                       decoration: InputDecoration(
                         hintText: 'Describe the issue…',
-                        hintStyle: const TextStyle(fontSize: 13, color: Color(0xFFAAAAAA)),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        hintStyle: const TextStyle(color: Color(0xFFAAAAAA), fontSize: 13),
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                         focusedBorder: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(10),
                           borderSide: const BorderSide(color: Color(0xFF1A7A72)),
                         ),
+                        contentPadding: const EdgeInsets.all(12),
                       ),
-                      style: const TextStyle(fontSize: 13),
-                      onChanged: (_) => setDialogState(() {}),
                     ),
+                    const SizedBox(height: 8),
                   ],
+                  const SizedBox(height: 8),
+                  Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Cancel', style: TextStyle(color: Color(0xFF888888), fontSize: 15)),
+                    ),
+                    TextButton(
+                      onPressed: canSubmit
+                          ? () async {
+                              final reason = isOther ? otherCtrl.text.trim() : selected!;
+                              Navigator.pop(ctx);
+                              await _reportInaccurate(msg, reason);
+                            }
+                          : null,
+                      child: Text('Submit', style: TextStyle(
+                        color: canSubmit ? const Color(0xFFE53935) : const Color(0xFFBBBBBB),
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                      )),
+                    ),
+                  ]),
                 ],
               ),
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel', style: TextStyle(color: Color(0xFF888888))),
-              ),
-              TextButton(
-                onPressed: canSubmit
-                    ? () async {
-                        final reason = isOther ? otherCtrl.text.trim() : selected!;
-                        Navigator.pop(ctx);
-                        await _reportInaccurate(msg, reason);
-                      }
-                    : null,
-                child: Text(
-                  'Submit',
-                  style: TextStyle(
-                    color: canSubmit ? const Color(0xFFE53935) : const Color(0xFFBBBBBB),
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
           );
         },
       ),

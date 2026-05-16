@@ -4,8 +4,6 @@ import 'package:flutter/material.dart';
 // Customize Chatroom Page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default preview messages shown in the Customize Chatroom screen.
-/// These are always the same regardless of which conversation you're customizing.
 const _kPreviewMessages = [
   {
     'sender': 'them',
@@ -27,18 +25,24 @@ const _kPreviewMessages = [
   },
 ];
 
-// ── Wallpaper options ─────────────────────────────────────────────────────────
+// ── Wallpaper image options (in display order) ────────────────────────────────
+const _kWallpaperImages = [
+  'background', '10', '11', '12', '13', '14', '15', '16',
+  '1', '2', '3', '4', '5', '6', '7', '8',
+];
+
+// ── Wallpaper color options ───────────────────────────────────────────────────
 const _kWallpapers = [
-  _WallpaperOption(key: 'default', label: 'Default', color: Color(0xFFF0EDE6), isDefault: true),
-  _WallpaperOption(key: 'white',   label: 'White',   color: Colors.white),
-  _WallpaperOption(key: 'grey',    label: 'Grey',    color: Color(0xFFE0DDD8)),
-  _WallpaperOption(key: 'mint',    label: 'Mint',    color: Color(0xFFD4EDE6)),
-  _WallpaperOption(key: 'sky',     label: 'Sky',     color: Color(0xFFD4E8F5)),
-  _WallpaperOption(key: 'lavender',label: 'Lavender',color: Color(0xFFEBDFF5)),
-  _WallpaperOption(key: 'peach',   label: 'Peach',   color: Color(0xFFFAE3C8)),
-  _WallpaperOption(key: 'green',   label: 'Green',   color: Color(0xFFD4EDD4)),
-  _WallpaperOption(key: 'pink',    label: 'Pink',    color: Color(0xFFF5D4DC)),
-  _WallpaperOption(key: 'steel',   label: 'Steel',   color: Color(0xFFD8DDE5)),
+  _WallpaperOption(key: 'default',  label: 'Default',  color: Color(0xFFF0EDE6), isDefault: true),
+  _WallpaperOption(key: 'white',    label: 'White',    color: Colors.white),
+  _WallpaperOption(key: 'grey',     label: 'Grey',     color: Color(0xFFE0DDD8)),
+  _WallpaperOption(key: 'mint',     label: 'Mint',     color: Color(0xFFD4EDE6)),
+  _WallpaperOption(key: 'sky',      label: 'Sky',      color: Color(0xFFD4E8F5)),
+  _WallpaperOption(key: 'lavender', label: 'Lavender', color: Color(0xFFEBDFF5)),
+  _WallpaperOption(key: 'peach',    label: 'Peach',    color: Color(0xFFFAE3C8)),
+  _WallpaperOption(key: 'green',    label: 'Green',    color: Color(0xFFD4EDD4)),
+  _WallpaperOption(key: 'pink',     label: 'Pink',     color: Color(0xFFF5D4DC)),
+  _WallpaperOption(key: 'steel',    label: 'Steel',    color: Color(0xFFD8DDE5)),
 ];
 
 // ── Theme (accent) options ────────────────────────────────────────────────────
@@ -82,14 +86,8 @@ class _ThemeOption {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class CustomizeChatroomPage extends StatefulWidget {
-  /// The conversation name / sender this page was opened from.
-  /// It's passed for context but the preview is always the default messages.
   final String senderName;
-
-  /// Called when the user taps "Apply to This Conversation".
   final void Function(String wallpaperKey, String themeKey)? onApplyToThis;
-
-  /// Called when the user taps "Apply to All Conversations".
   final void Function(String wallpaperKey, String themeKey)? onApplyToAll;
 
   const CustomizeChatroomPage({
@@ -104,25 +102,32 @@ class CustomizeChatroomPage extends StatefulWidget {
 }
 
 class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
-  // ── Saved (applied) values ──────────────────────────────────────────────
-  String _savedWallpaper = 'default';
-  String _savedTheme     = 'teal';
-
-  // ── Current (unsaved) selections ────────────────────────────────────────
-  String _selectedWallpaper = 'default';
+  String _savedWallpaper    = 'background';
+  String _savedTheme        = 'teal';
+  String _selectedWallpaper = 'background';
   String _selectedTheme     = 'teal';
 
   bool get _hasUnsavedChanges =>
       _selectedWallpaper != _savedWallpaper ||
           _selectedTheme != _savedTheme;
 
-  // ── Helpers ─────────────────────────────────────────────────────────────
-
   Color get _currentThemeColor =>
       _kThemes.firstWhere((t) => t.key == _selectedTheme).color;
 
-  Color get _currentWallpaperColor =>
-      _kWallpapers.firstWhere((w) => w.key == _selectedWallpaper).color;
+  // Image wallpaper if key is in _kWallpaperImages, otherwise null
+  String? get _currentWallpaperAsset {
+    if (_kWallpaperImages.contains(_selectedWallpaper)) {
+      return 'assets/images/$_selectedWallpaper.png';
+    }
+    return null;
+  }
+
+  // Color wallpaper fallback
+  Color get _currentWallpaperColor {
+    final match = _kWallpapers.where((w) => w.key == _selectedWallpaper);
+    if (match.isNotEmpty) return match.first.color;
+    return const Color(0xFFF0EDE6);
+  }
 
   void _applyToThis() {
     setState(() {
@@ -145,15 +150,10 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
   Future<bool> _onWillPop() async {
     if (!_hasUnsavedChanges) return true;
     final result = await _showUnsavedDialog();
-    if (result == null) return false;  // Cancel → stay
-    if (result == false) return true;  // Discard → leave without saving
-    return true;                       // Save → leave after saving
+    if (result == null) return false;
+    return true;
   }
 
-  /// Returns:
-  ///   null  → cancelled (stay on page, keep edits)
-  ///   false → disregard (leave without saving)
-  ///   true  → saved (leave after saving)
   Future<bool?> _showUnsavedDialog() async {
     return showDialog<bool>(
       context: context,
@@ -168,12 +168,12 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
         actionsPadding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(null), // stay
+            onPressed: () => Navigator.of(ctx).pop(null),
             child: const Text('Cancel',
                 style: TextStyle(color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
           ),
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false), // discard
+            onPressed: () => Navigator.of(ctx).pop(false),
             child: const Text('Discard',
                 style: TextStyle(color: Color(0xFFF2554F), fontWeight: FontWeight.w600)),
           ),
@@ -183,7 +183,7 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
                 _savedWallpaper = _selectedWallpaper;
                 _savedTheme     = _selectedTheme;
               });
-              Navigator.of(ctx).pop(true); // saved
+              Navigator.of(ctx).pop(true);
             },
             child: Text('Save',
                 style: TextStyle(color: _currentThemeColor, fontWeight: FontWeight.w600)),
@@ -192,8 +192,6 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
       ),
     );
   }
-
-  // ── Build ────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -217,13 +215,8 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
               style: TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
         ),
         body: Column(children: [
-          // ── Preview area ──────────────────────────────────────────────
           _buildPreview(),
-
-          // ── Message input bar (static, visual only) ───────────────────
           _buildInputBar(),
-
-          // ── Settings panels ───────────────────────────────────────────
           Expanded(
             child: ListView(
               padding: const EdgeInsets.only(bottom: 24),
@@ -240,100 +233,109 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
     );
   }
 
-  // ── Preview ──────────────────────────────────────────────────────────────
+  // ── Preview ───────────────────────────────────────────────────────────────
 
   Widget _buildPreview() {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 250),
-      color: _currentWallpaperColor,
-      padding: const EdgeInsets.fromLTRB(12,120,12,8),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: _kPreviewMessages.map((msg) {
-          final isMe     = msg['sender'] == 'me';
-          final label    = msg['label'] as String?;
-          final isPhish  = label == 'Phishing';
-          final isSafe   = label == 'Safe';
+    final asset = _currentWallpaperAsset;
+    return SizedBox(
+      height: 450,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          asset != null
+              ? Image.asset(asset, fit: BoxFit.cover)
+              : ColoredBox(color: _currentWallpaperColor),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: _kPreviewMessages.map((msg) {
+                final isMe    = msg['sender'] == 'me';
+                final label   = msg['label'] as String?;
+                final isPhish = label == 'Phishing';
 
-          final bubbleColor = isMe
-              ? _currentThemeColor   // only the "me" bubble uses theme color
-              : isPhish
-              ? const Color(0xFFFFE8E8)   // phishing always red tint
-              : const Color(0xFFD6F0E8);  // safe always green tint
+                final bubbleColor = isMe
+                    ? _currentThemeColor
+                    : isPhish
+                    ? const Color(0xFFFFE8E8)
+                    : const Color(0xFFD6F0E8);
 
-          final textColor = isMe ? Colors.white : Colors.black87;
+                final textColor = isMe ? Colors.white : Colors.black87;
 
-          return Align(
-            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-            child: Container(
-              margin: const EdgeInsets.only(bottom: 4),
-              constraints: BoxConstraints(
-                  maxWidth: MediaQuery.of(context).size.width * 0.72),
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-              decoration: BoxDecoration(
-                color: bubbleColor,
-                borderRadius: isMe
-                    ? const BorderRadius.only(
-                  topLeft: Radius.circular(18),
-                  topRight: Radius.circular(4),
-                  bottomLeft: Radius.circular(18),
-                  bottomRight: Radius.circular(18),
-                )
-                    : const BorderRadius.only(
-                  topLeft: Radius.circular(4),
-                  topRight: Radius.circular(18),
-                  bottomLeft: Radius.circular(18),
-                  bottomRight: Radius.circular(18),
-                ),
-              ),
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(msg['text'] as String,
-                        style: TextStyle(
-                            fontSize: 13,
-                            color: textColor,
-                            height: 1.4)),
-                    const SizedBox(height: 4),
-                    Text(msg['time'] as String,
-                        style: TextStyle(
-                            fontSize: 11,
-                            color:
-                            isMe ? Colors.white70 : const Color(0xFF999999))),
-                    if (label != null) ...[
-                      const SizedBox(height: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: isPhish
-                              ? const Color(0xFFF2554F)
-                              : const Color(0xFF06C85E),
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(
-                            isPhish
-                                ? Icons.warning_rounded
-                                : Icons.shield_outlined,
-                            size: 11,
-                            color: Colors.white,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            isPhish ? 'Phishing Detected' : 'Safe',
-                            style: const TextStyle(
-                                fontSize: 11,
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600),
-                          ),
-                        ]),
+                return Align(
+                  alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    constraints: BoxConstraints(
+                        maxWidth: MediaQuery.of(context).size.width * 0.72),
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                    decoration: BoxDecoration(
+                      color: bubbleColor,
+                      borderRadius: isMe
+                          ? const BorderRadius.only(
+                        topLeft: Radius.circular(18),
+                        topRight: Radius.circular(4),
+                        bottomLeft: Radius.circular(18),
+                        bottomRight: Radius.circular(18),
+                      )
+                          : const BorderRadius.only(
+                        topLeft: Radius.circular(4),
+                        topRight: Radius.circular(18),
+                        bottomLeft: Radius.circular(18),
+                        bottomRight: Radius.circular(18),
                       ),
-                    ],
-                  ]),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(msg['text'] as String,
+                            style: TextStyle(
+                                fontSize: 13, color: textColor, height: 1.4)),
+                        const SizedBox(height: 4),
+                        Text(msg['time'] as String,
+                            style: TextStyle(
+                                fontSize: 11,
+                                color: isMe
+                                    ? Colors.white70
+                                    : const Color(0xFF999999))),
+                        if (label != null) ...[
+                          const SizedBox(height: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: isPhish
+                                  ? const Color(0xFFF2554F)
+                                  : const Color(0xFF06C85E),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(
+                                isPhish
+                                    ? Icons.warning_rounded
+                                    : Icons.shield_outlined,
+                                size: 11,
+                                color: Colors.white,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                isPhish ? 'Phishing Detected' : 'Safe',
+                                style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600),
+                              ),
+                            ]),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                );
+              }).toList(),
             ),
-          );
-        }).toList(),
+          ),
+        ],
       ),
     );
   }
@@ -342,8 +344,8 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
 
   Widget _buildInputBar() {
     return Container(
-      color: _currentWallpaperColor,
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+      color: const Color(0xFFF6F4EC),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
       child: Row(children: [
         Expanded(
           child: Container(
@@ -356,8 +358,7 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
             alignment: Alignment.centerLeft,
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: const Text('Type a message...',
-                style: TextStyle(
-                    color: Color(0xFFAAAAAA), fontSize: 14)),
+                style: TextStyle(color: Color(0xFFAAAAAA), fontSize: 14)),
           ),
         ),
         const SizedBox(width: 8),
@@ -369,8 +370,7 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
             color: _currentThemeColor,
             shape: BoxShape.circle,
           ),
-          child: const Icon(Icons.send_rounded,
-              color: Colors.white, size: 20),
+          child: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
         ),
       ]),
     );
@@ -386,9 +386,9 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
             style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
       ),
 
-      // Import from Gallery tile
+      // Import from Gallery
       InkWell(
-        onTap: () {}, // placeholder
+        onTap: () {},
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
           child: Row(children: [
@@ -410,13 +410,89 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
         ),
       ),
 
+      // ── Image designs ──────────────────────────────────────────────────
+      const Padding(
+        padding: EdgeInsets.fromLTRB(16, 0, 16, 10),
+        child: Text('Or choose a design:',
+            style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
+      ),
+
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 5,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            childAspectRatio: 0.75,
+          ),
+          itemCount: _kWallpaperImages.length,
+          itemBuilder: (_, i) {
+            final key        = _kWallpaperImages[i];
+            final isSelected = _selectedWallpaper == key;
+            return GestureDetector(
+              onTap: () => setState(() => _selectedWallpaper = key),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: isSelected ? _currentThemeColor : Colors.transparent,
+                    width: 2.5,
+                  ),
+                  boxShadow: isSelected
+                      ? [BoxShadow(
+                    color: _currentThemeColor.withOpacity(.35),
+                    blurRadius: 8,
+                    spreadRadius: 1,
+                  )]
+                      : [],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Image.asset(
+                        'assets/images/$key.png',
+                        fit: BoxFit.cover,
+                      ),
+                      if (isSelected)
+                        Container(
+                          color: Colors.black.withOpacity(.25),
+                          child: Center(
+                            child: Container(
+                              width: 28,
+                              height: 28,
+                              decoration: BoxDecoration(
+                                color: _currentThemeColor,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(Icons.check,
+                                  color: Colors.white, size: 16),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+
+      const SizedBox(height: 12),
+
+      // ── Color options ──────────────────────────────────────────────────
       const Padding(
         padding: EdgeInsets.fromLTRB(16, 0, 16, 10),
         child: Text('Or choose a color:',
             style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
       ),
 
-      // Color grid
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Wrap(
@@ -441,11 +517,10 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
                       width: isSelected ? 2.5 : 1.5,
                     ),
                     boxShadow: isSelected
-                        ? [
-                      BoxShadow(
-                          color: _currentThemeColor.withOpacity(.3),
-                          blurRadius: 8)
-                    ]
+                        ? [BoxShadow(
+                      color: _currentThemeColor.withOpacity(.3),
+                      blurRadius: 8,
+                    )]
                         : [],
                   ),
                   child: isSelected
@@ -471,6 +546,8 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
           }).toList(),
         ),
       ),
+
+      const SizedBox(height: 8),
     ]);
   }
 
@@ -506,18 +583,15 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
                     color: opt.color,
                     shape: BoxShape.circle,
                     border: Border.all(
-                      color: isSelected
-                          ? Colors.black38
-                          : Colors.transparent,
+                      color: isSelected ? Colors.black38 : Colors.transparent,
                       width: isSelected ? 2.5 : 0,
                     ),
                     boxShadow: isSelected
-                        ? [
-                      BoxShadow(
-                          color: opt.color.withOpacity(.4),
-                          blurRadius: 10,
-                          spreadRadius: 1)
-                    ]
+                        ? [BoxShadow(
+                      color: opt.color.withOpacity(.4),
+                      blurRadius: 10,
+                      spreadRadius: 1,
+                    )]
                         : [],
                   ),
                   child: isSelected

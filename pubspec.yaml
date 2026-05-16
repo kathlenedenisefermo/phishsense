@@ -38,6 +38,22 @@ flutter:
     - assets/images/phishsense_logo.png
     - assets/images/icon.png
     - assets/images/welcome.png
+    - assets/images/background.png
+    - assets/images/1.png
+    - assets/images/2.png
+    - assets/images/3.png
+    - assets/images/4.png
+    - assets/images/5.png
+    - assets/images/6.png
+    - assets/images/7.png
+    - assets/images/8.png
+    - assets/images/10.png
+    - assets/images/11.png
+    - assets/images/12.png
+    - assets/images/13.png
+    - assets/images/14.png
+    - assets/images/15.png
+    - assets/images/16.png
     
 flutter_launcher_icons:
   android: true

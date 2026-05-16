@@ -2135,7 +2135,7 @@ class _ConversationPageState extends State<_ConversationPage> {
     final matchCount = matches.length;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF0EDE6),
+      backgroundColor: null,
       appBar: _selectMode
           ? AppBar(
         backgroundColor: const Color(0xFF1A7A72),
@@ -2310,7 +2310,8 @@ class _ConversationPageState extends State<_ConversationPage> {
         final msgs = widget.messages.reversed.toList();
         final phishingIndices = _phishingIndices;
         final phishingCount   = phishingIndices.length;
-        return Column(
+        return Stack(children: [
+        Column(
           children: [
             if (phishingCount > 0)
               Container(
@@ -2371,9 +2372,10 @@ class _ConversationPageState extends State<_ConversationPage> {
                 ]),
               ),
             Expanded(child: Stack(
-          children: [
-            ListView.builder(
-              controller: _scrollCtrl,
+              children: [
+                Positioned.fill(child: Image.asset('assets/images/background.png', fit: BoxFit.cover)),
+                ListView.builder(
+                  controller: _scrollCtrl,
               padding: const EdgeInsets.only(top: 16, bottom: 32),
               itemCount: msgs.length,
               itemBuilder: (_, i) {
@@ -2524,35 +2526,36 @@ class _ConversationPageState extends State<_ConversationPage> {
             );
           },
         ),
-            if (_showScrollDown)
-              Positioned(
-                right: 16,
-                bottom: 20,
-                child: FloatingActionButton.small(
-                  heroTag: 'scrollDown',
-                  onPressed: () => _scrollCtrl.animateTo(
-                    _scrollCtrl.position.maxScrollExtent,
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeOut,
-                  ),
-                  backgroundColor: const Color(0xFF1A7A72),
-                  foregroundColor: Colors.white,
-                  elevation: 4,
-                  shape: const CircleBorder(),
-                  child: const Icon(Icons.keyboard_arrow_down, size: 28),
-                ),
-              ),
-          ],
+        if (_showScrollDown)
+        Positioned(
+        right: 16,
+        bottom: 20,
+        child: FloatingActionButton.small(
+        heroTag: 'scrollDown',
+        onPressed: () => _scrollCtrl.animateTo(
+        _scrollCtrl.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+        ),
+        backgroundColor: const Color(0xFF1A7A72),
+        foregroundColor: Colors.white,
+        elevation: 4,
+        shape: const CircleBorder(),
+        child: const Icon(Icons.keyboard_arrow_down, size: 28),
+        ),
+        ),
+        ],
         )),
           ],
-        );
+        ),
+        ]);
       }),
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Verification step widget (used in redesigned dialog)
+// Verification step widget
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _VerifStep extends StatelessWidget {
@@ -4268,17 +4271,17 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
     final matches    = _matchIndices;
     final matchCount = matches.length;
     return Scaffold(
-      backgroundColor: const Color(0xFFF0EDE6),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF1A7A72),
-        foregroundColor: Colors.white,
-        elevation: 0,
-        centerTitle: false,
-        title: Text(widget.sender, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
-        actions: [
-          if (!_searchActive)
-            IconButton(icon: const Icon(Icons.more_vert), onPressed: () => _showThreeDotMenu(ctx)),
-        ],
+      backgroundColor: Colors.transparent,
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF1A7A72),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          centerTitle: false,
+          title: Text(widget.sender, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
+          actions: [
+            if (!_searchActive)
+              IconButton(icon: const Icon(Icons.more_vert), onPressed: () => _showThreeDotMenu(ctx)),
+          ],
         bottom: _searchActive
             ? PreferredSize(
                 preferredSize: const Size.fromHeight(58),
@@ -4348,10 +4351,12 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
               )
             : null,
       ),
-      body: Builder(builder: (_) {
-        final msgs = widget.messages.reversed.toList();
-        return ListView.builder(
-          controller: _scrollCtrl,
+        body: Builder(builder: (_) {
+          final msgs = widget.messages.reversed.toList();
+          return Stack(children: [
+            Positioned.fill(child: Image.asset('assets/images/background.png', fit: BoxFit.cover)),
+            ListView.builder(
+            controller: _scrollCtrl,
           padding: const EdgeInsets.fromLTRB(0, 16, 0, 32),
           itemCount: msgs.length,
           itemBuilder: (_, i) {
@@ -4486,9 +4491,10 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
               ),
             ]);
           },
-        );
-      }),
-    );
+            ),
+          ]);   // closes Stack children + Stack
+        }),      // closes Builder
+    );           // closes Scaffold
   }
 }
 

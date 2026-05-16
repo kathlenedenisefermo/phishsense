@@ -1108,22 +1108,19 @@ Future<void> submitReport({
   required String originalLabel,
   required double confidence,
   required String reason,
-
-  // These are accepted but intentionally ignored
-  // so old and new documents stay consistent
   String deviceId  = '',
   String sender    = '',
   String messageId = '',
   String source    = 'inbox',
 }) async {
   try {
-    final correctedLabel = originalLabel.toLowerCase() == 'phishing'
-        ? 'legitimate'
-        : 'phishing';
-
     final messageHash = sha256
         .convert(utf8.encode(messageBody))
         .toString();
+
+    final correctedLabel = originalLabel.toLowerCase() == 'phishing'
+        ? 'legitimate'
+        : 'phishing';
 
     await FirebaseFirestore.instance
         .collection('model_feedback')

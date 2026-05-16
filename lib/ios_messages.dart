@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import 'package:crypto/crypto.dart';
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
@@ -935,6 +936,9 @@ class _ConversationPageState extends State<_ConversationPage> {
   final Set<int> _selectedIndices = {};
   final Set<int> _starredIndices = {};
 
+  Color  _themeColor   = const Color(0xFF1A7A72);
+  String _wallpaperKey = 'background';
+
   bool    _phishingNavActive    = false;
   int     _phishingNavIdx       = 0;
   String? _phishingHighlightTime;
@@ -945,6 +949,7 @@ class _ConversationPageState extends State<_ConversationPage> {
     _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
     _reportHighlightTime = widget.highlightMessageTime;
     _loadStatus();
+    _loadChatroomPrefs();
     _startRealtimeListener();
     _scrollCtrl.addListener(() {
       if (!_scrollCtrl.hasClients) return;
@@ -1039,6 +1044,26 @@ class _ConversationPageState extends State<_ConversationPage> {
         await _saveStatus();
       }
     }, onError: (e) => debugPrint('Realtime listener error: $e'));
+  }
+
+  Future<void> _loadChatroomPrefs() async {
+    final prefs = await loadChatroomPrefs(widget.sender);
+    if (!mounted) return;
+    Color color = const Color(0xFF1A7A72);
+    for (final t in kThemes) {
+      if (t.key == prefs.theme) { color = t.color; break; }
+    }
+    setState(() {
+      _themeColor   = color;
+      _wallpaperKey = prefs.wallpaper;
+    });
+  }
+
+  Color _wallpaperColorFromKey(String key) {
+    for (final w in kWallpapers) {
+      if (w.key == key) return w.color;
+    }
+    return const Color(0xFFF0EDE6);
   }
 
   Future<void> _loadStatus() async {
@@ -1484,23 +1509,152 @@ class _ConversationPageState extends State<_ConversationPage> {
                                   final msgTime = msg['time']?.toString() ?? '';
                                   Navigator.pop(confirmCtx);
                                   Navigator.pop(dlgCtx);
-                                  setState(() => _reportStatus[msgTime] = 'pending');
-                                  _saveStatus();
-                                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                                    if (mounted) _showVerificationDialog(ctx);
+
+                                  final messageHash = sha256
+                                      .convert(utf8.encode(msg['message']?.toString() ?? ''))
+                                      .toString();
+
+                                  FirebaseFirestore.instance
+                                      .collection('model_feedback')
+                                      .where('messageHash', isEqualTo: messageHash)
+                                      .get()
+                                      .then((existing) {
+                                    if (!mounted) return;
+
+                                    if (existing.docs.isNotEmpty) {
+                                      final doc = existing.docs.first.data();
+                                      final status = doc['status']?.toString() ?? '';
+                                      const reviewedStatuses = ['trained', 'verified', 'validated', 'rejected'];
+
+                                      if (reviewedStatuses.contains(status)) {
+                                        setState(() => _reportStatus[msgTime] = status);
+                                        _saveStatus();
+                                        final isAccepted = status == 'verified' || status == 'validated' || status == 'trained';
+                                        final color = isAccepted ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+                                        final actionTaken = isPhishing
+                                            ? (isAccepted ? 'Label updated to Safe.' : 'Label remains Phishing.')
+                                            : (isAccepted ? 'Label updated to Phishing.' : 'Label remains Safe.');
+                                        showDialog(
+                                          context: ctx,
+                                          barrierDismissible: false,
+                                          barrierColor: Colors.black.withOpacity(.4),
+                                          builder: (reviewedCtx) => Dialog(
+                                            backgroundColor: Colors.transparent,
+                                            child: Container(
+                                              decoration: BoxDecoration(
+                                                color: const Color(0xFFF6F4EC),
+                                                borderRadius: BorderRadius.circular(24),
+                                                boxShadow: [BoxShadow(color: Colors.black.withOpacity(.15), blurRadius: 24, offset: const Offset(0, 8))],
+                                              ),
+                                              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                                // ── Header ──
+                                                Padding(
+                                                  padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
+                                                  child: Row(children: [
+                                                    Icon(isAccepted ? Icons.check_circle : Icons.cancel, color: color, size: 28),
+                                                    const SizedBox(width: 10),
+                                                    const Expanded(
+                                                      child: Text('Already Reviewed',
+                                                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                                                    ),
+                                                  ]),
+                                                ),
+                                                // ── Message preview ──
+                                                Padding(
+                                                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+                                                  child: Container(
+                                                    width: double.infinity,
+                                                    padding: const EdgeInsets.all(14),
+                                                    decoration: BoxDecoration(
+                                                      color: color.withOpacity(.08),
+                                                      borderRadius: BorderRadius.circular(14),
+                                                      border: Border.all(color: color.withOpacity(.2)),
+                                                    ),
+                                                    child: Text(
+                                                      (msg['message']?.toString() ?? '').length > 120
+                                                          ? '${(msg['message']?.toString() ?? '').substring(0, 120)}…'
+                                                          : msg['message']?.toString() ?? '',
+                                                      style: const TextStyle(fontSize: 13, color: Color(0xFF333333), height: 1.5),
+                                                    ),
+                                                  ),
+                                                ),
+                                                // ── Details rows ──
+                                                Padding(
+                                                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                                                  child: Column(children: [
+                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                                      const SizedBox(width: 110, child: Text('Reported as:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
+                                                      Expanded(child: Text(isPhishing ? 'Phishing' : 'Safe',
+                                                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.black87))),
+                                                    ]),
+                                                    const SizedBox(height: 8),
+                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                                      const SizedBox(width: 110, child: Text('Report Status:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
+                                                      Row(children: [
+                                                        Icon(isAccepted ? Icons.check_circle : Icons.cancel_outlined, size: 14, color: color),
+                                                        const SizedBox(width: 4),
+                                                        Text(isAccepted ? 'Accepted' : 'Rejected',
+                                                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: color)),
+                                                      ]),
+                                                    ]),
+                                                    const SizedBox(height: 8),
+                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                                      const SizedBox(width: 110, child: Text('Action taken:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
+                                                      Expanded(child: Text(actionTaken,
+                                                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.black87))),
+                                                    ]),
+                                                  ]),
+                                                ),
+                                                // ── Got it button ──
+                                                Padding(
+                                                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                                                  child: SizedBox(
+                                                    width: double.infinity,
+                                                    child: ElevatedButton(
+                                                      onPressed: () => Navigator.pop(reviewedCtx),
+                                                      style: ElevatedButton.styleFrom(
+                                                        backgroundColor: color,
+                                                        foregroundColor: Colors.white,
+                                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                                        elevation: 0,
+                                                        padding: const EdgeInsets.symmetric(vertical: 14),
+                                                      ),
+                                                      child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ]),
+                                            ),
+                                          ),
+                                        );
+                                        return;
+                                      }
+                                      // Still pending
+                                      setState(() => _reportStatus[msgTime] = 'pending');
+                                      _saveStatus();
+                                      _showVerificationDialog(ctx);
+                                      return;
+                                    }
+
+                                    // Fresh report
+                                    setState(() => _reportStatus[msgTime] = 'pending');
+                                    _saveStatus();
+                                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                                      if (mounted) _showVerificationDialog(ctx);
+                                    });
+                                    submitReport(
+                                      messageBody: msg['message']?.toString() ?? '',
+                                      originalLabel: isPhishing ? 'phishing' : 'legitimate',
+                                      confidence: ((msg['confidence'] as num?)?.toDouble() ?? 0.0),
+                                      reason: selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
+                                      deviceId: widget.deviceId,
+                                      sender: widget.sender,
+                                      messageId: msg['time']?.toString() ?? '',
+                                      source: 'inbox',
+                                    );
                                   });
-                                  submitReport(
-                                    messageBody: msg['message']?.toString() ?? '',
-                                    originalLabel: isPhishing ? 'phishing' : 'legitimate',
-                                    confidence: ((msg['confidence'] as num?)?.toDouble() ?? 0.0),
-                                    reason: selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
-                                    deviceId: widget.deviceId,
-                                    sender: widget.sender,
-                                    messageId: msg['time']?.toString() ?? '',
-                                    source: 'inbox',
-                                  );
                                 },
-                                style: ElevatedButton.styleFrom(
+                                style: ElevatedButton.styleFrom(   // keep your existing style unchanged
                                   backgroundColor: const Color(0xFFF2554F),
                                   foregroundColor: Colors.white,
                                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
@@ -1929,7 +2083,9 @@ class _ConversationPageState extends State<_ConversationPage> {
                 senderName: widget.sender,
               ),
             ),
-          );
+          ).then((_) {
+            if (mounted) _loadChatroomPrefs();
+          });
         }),
       ],
     );
@@ -2138,7 +2294,7 @@ class _ConversationPageState extends State<_ConversationPage> {
       backgroundColor: null,
       appBar: _selectMode
           ? AppBar(
-        backgroundColor: const Color(0xFF1A7A72),
+        backgroundColor: _themeColor,
         foregroundColor: Colors.white,
         elevation: 0,
         leading: IconButton(
@@ -2224,7 +2380,7 @@ class _ConversationPageState extends State<_ConversationPage> {
         ],
       )
           : AppBar(
-        backgroundColor: const Color(0xFF1A7A72),
+        backgroundColor: _themeColor,
         foregroundColor: Colors.white,
         elevation: 0,
         centerTitle: false,
@@ -2249,7 +2405,7 @@ class _ConversationPageState extends State<_ConversationPage> {
                         child: Container(
                           height: 42,
                           decoration: BoxDecoration(
-                            color: const Color(0xFF155F59),
+                            color: _themeColor.withOpacity(0.7),
                             borderRadius: BorderRadius.circular(24),
                           ),
                           child: TextField(
@@ -2373,7 +2529,11 @@ class _ConversationPageState extends State<_ConversationPage> {
               ),
             Expanded(child: Stack(
               children: [
-                Positioned.fill(child: Image.asset('assets/images/background.png', fit: BoxFit.cover)),
+                Positioned.fill(
+                  child: kWallpaperImages.contains(_wallpaperKey)
+                      ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
+                      : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
+                ),
                 ListView.builder(
                   controller: _scrollCtrl,
               padding: const EdgeInsets.only(top: 16, bottom: 32),
@@ -3685,6 +3845,9 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   bool   _searchActive    = false;
   String _query           = '';
   int    _currentMatchIdx = 0;
+  Color  _themeColor   = const Color(0xFF1A7A72);
+  String _wallpaperKey = 'background';
+
   final Map<String, String> _reportStatus  = {};
   final Set<String> _dismissedNotes        = {};
   String get _statusKey =>
@@ -3698,6 +3861,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
     super.initState();
     _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
     _loadAndSyncStatus();
+    _loadChatroomPrefs();
     _startRealtimeListener();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _scrollCtrl.hasClients) {
@@ -3752,6 +3916,26 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
         await _saveStatus();
       }
     }, onError: (e) => debugPrint('Spam realtime listener error: $e'));
+  }
+
+  Future<void> _loadChatroomPrefs() async {
+    final prefs = await loadChatroomPrefs(widget.sender);
+    if (!mounted) return;
+    Color color = const Color(0xFF1A7A72);
+    for (final t in kThemes) {
+      if (t.key == prefs.theme) { color = t.color; break; }
+    }
+    setState(() {
+      _themeColor   = color;
+      _wallpaperKey = prefs.wallpaper;
+    });
+  }
+
+  Color _wallpaperColorFromKey(String key) {
+    for (final w in kWallpapers) {
+      if (w.key == key) return w.color;
+    }
+    return const Color(0xFFF0EDE6);
   }
 
   Future<void> _loadAndSyncStatus() async {
@@ -4273,7 +4457,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
     return Scaffold(
       backgroundColor: Colors.transparent,
         appBar: AppBar(
-          backgroundColor: const Color(0xFF1A7A72),
+          backgroundColor: _themeColor,
           foregroundColor: Colors.white,
           elevation: 0,
           centerTitle: false,
@@ -4354,7 +4538,11 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
         body: Builder(builder: (_) {
           final msgs = widget.messages.reversed.toList();
           return Stack(children: [
-            Positioned.fill(child: Image.asset('assets/images/background.png', fit: BoxFit.cover)),
+            Positioned.fill(
+              child: kWallpaperImages.contains(_wallpaperKey)
+                  ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
+                  : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
+            ),
             ListView.builder(
             controller: _scrollCtrl,
           padding: const EdgeInsets.fromLTRB(0, 16, 0, 32),

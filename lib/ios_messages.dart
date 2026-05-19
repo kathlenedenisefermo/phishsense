@@ -1787,7 +1787,6 @@ class _ConversationPageState extends State<_ConversationPage> {
                                           type          : 'inaccurate_report',
                                         );
                                         if (mounted) {
-                                          // Show the full review dialog with Go to message
                                           _showAlreadyReviewedDialog(
                                             ctx,
                                             tempReport,
@@ -3152,7 +3151,6 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
         wasInSpam = false;
       }
       if (entry == null) return false;
-      if (entry['verifiedByCrew'] == true) return false;
 
       entry['verifiedByCrew'] = true;
       final bool wasPhishing  = originalLabel == 'phishing';
@@ -3459,9 +3457,8 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                             final doc = existing.docs.first.data();
                             final status = doc['status']?.toString() ?? '';
                             if (reviewedStatuses.contains(status)) {
-                              // Don't re-apply — the label is already correct in local storage.
-                              // Just read the current actual label and show the dialog.
                               final currentLabel = (doc['originalLabel'] ?? sample['label'] ?? 'phishing').toString().toLowerCase() == 'phishing' ? 'phishing' : 'legitimate';
+                              await _applyReviewDecision(msgTime, status, currentLabel);
                               await _loadSpam();
                               return;
                             }
@@ -3615,6 +3612,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                       // Don't re-apply — the label is already correct in local storage.
                                       // Just read the current actual label and show the dialog.
                                       final currentLabel = (doc['originalLabel'] ?? sample['label'] ?? 'phishing').toString().toLowerCase() == 'phishing' ? 'phishing' : 'legitimate';
+                                      await _applyReviewDecision(msgTime, status, currentLabel);
                                       await _loadSpam();
 
                                       final p2 = await SharedPreferences.getInstance();
@@ -3709,7 +3707,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                                               Navigator.pop(dlgCtx);
                                                               Navigator.of(context).popUntil((route) => route.isFirst);
                                                               Future.delayed(const Duration(milliseconds: 300), () {
-                                                                widget.onOpenConversation?.call(tempReport.sender, tempReport.message);
+                                                                widget.onOpenConversation?.call(sender, tempReport.message);
                                                               });
                                                             },
                                                             icon: const Icon(Icons.arrow_forward_rounded, size: 18),

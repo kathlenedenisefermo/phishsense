@@ -14,6 +14,8 @@ import 'package:share_plus/share_plus.dart';
 import 'customize_chatroom.dart';
 import 'report_model.dart';
 
+const String kSpamWallpaperDefault = '8';
+
 class IOSMessagesPage extends StatefulWidget {
   final String name;
   const IOSMessagesPage({super.key, required this.name});
@@ -95,9 +97,15 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
           : <String>{};
       const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
       final count = snap.docs.where((doc) {
-        final data = doc.data() as Map<String, dynamic>;
+        final data   = doc.data() as Map<String, dynamic>;
         final status = data['status']?.toString() ?? '';
-        return reviewedStatuses.contains(status) && !viewed.contains(doc.id);
+        final src    = (data['source'] ?? 'inbox').toString();
+        // Inbox badge: only inbox-sourced reports (or legacy)
+        // When spam is off, also include spam-sourced since they show in inbox tab
+        final isInboxReport = src == 'inbox' || !_spamEnabled;
+        return reviewedStatuses.contains(status)
+            && !viewed.contains(doc.id)
+            && isInboxReport;
       }).length;
       if (mounted) setState(() => _unviewedReportCount = count);
     }, onError: (e) => debugPrint('Report badge listener error: $e'));
@@ -403,6 +411,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
           formatTime: _formatTime,
           deviceId: _deviceId,
           spamEnabled: _spamEnabled,
+          onOpenConversation: _openConversationFromReport,
           onOpenReportTracker: () => Navigator.push(
             context,
             MaterialPageRoute(
@@ -431,12 +440,15 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
 
   // ── Navigate to conversation from report card ─────────────────────────────
 
-  void _openConversationFromReport(String sender, String messageBody) {
-    // Match by messageBody since sender/messageId are not stored in Firebase
+  void _openConversationFromReport(String sender, String messageBody) async {
+    await _loadMessages();
+
     Map<String, dynamic>? matchedThread;
     String? matchedMessageTime;
 
+    // Search by sender first
     for (final t in _threads) {
+      if (sender.isNotEmpty && (t['sender'] as String) != sender) continue;
       final msgs = t['messages'] as List<Map<String, dynamic>>;
       for (final m in msgs) {
         final body = (m['message'] ?? '').toString().trim();
@@ -449,21 +461,43 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
       if (matchedThread != null) break;
     }
 
+    // Fallback: search all threads ignoring sender
+    if (matchedThread == null) {
+      for (final t in _threads) {
+        final msgs = t['messages'] as List<Map<String, dynamic>>;
+        for (final m in msgs) {
+          final body = (m['message'] ?? '').toString().trim();
+          if (body == messageBody.trim()) {
+            matchedThread = t;
+            matchedMessageTime = m['time']?.toString();
+            break;
+          }
+        }
+        if (matchedThread != null) break;
+      }
+    }
+
     if (matchedThread == null) {
       _showCenterNotice('Conversation not found.');
       return;
     }
 
+    if (!mounted) return;
+
     final threadSender = matchedThread['sender'] as String;
-    Navigator.push(
-      context,
+    final threadMessages = List<Map<String, dynamic>>.from(
+        matchedThread['messages'] as List<Map<String, dynamic>>);
+
+    if (!mounted) return;
+    Navigator.of(_scaffoldKey.currentContext!, rootNavigator: true).push(
       MaterialPageRoute(
         builder: (_) => _ConversationPage(
-          messages: matchedThread!['messages'] as List<Map<String, dynamic>>,
+          messages: threadMessages,
           sender: threadSender,
           formatTime: _formatTime,
           deviceId: _deviceId,
           highlightMessageTime: matchedMessageTime,
+          spamFolderEnabled: false,
           onDeleteThread: () async {
             if (await _confirmDeleteThread(threadSender)) {
               await _deleteThread(threadSender);
@@ -472,7 +506,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
           },
         ),
       ),
-    );
+    ).then((_) => _loadMessages());
   }
 
   @override
@@ -713,6 +747,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
         child: ReportTrackerBody(
           deviceId: _deviceId,
           source: 'inbox',
+          spamFolderEnabled: _spamEnabled,
           onOpenConversation: _openConversationFromReport,
           onToggleHideReviewed: (fn) => _toggleHideReviewed = fn,
           onHideReviewedChanged: (val) => setState(() => _hideReviewed = val),
@@ -901,6 +936,8 @@ class _ConversationPage extends StatefulWidget {
   final String deviceId;
   final String? highlightMessageTime; // <── new: scroll to this message
 
+  final bool spamFolderEnabled;
+
   const _ConversationPage({
     required this.messages,
     required this.sender,
@@ -908,6 +945,7 @@ class _ConversationPage extends StatefulWidget {
     required this.onDeleteThread,
     required this.deviceId,
     this.highlightMessageTime,
+    this.spamFolderEnabled = false,
   });
   @override
   State<_ConversationPage> createState() => _ConversationPageState();
@@ -948,9 +986,8 @@ class _ConversationPageState extends State<_ConversationPage> {
     super.initState();
     _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
     _reportHighlightTime = widget.highlightMessageTime;
-    _loadStatus();
     _loadChatroomPrefs();
-    _startRealtimeListener();
+    _loadStatus().then((_) => _startRealtimeListener());
     _scrollCtrl.addListener(() {
       if (!_scrollCtrl.hasClients) return;
       final atBottom = _scrollCtrl.offset >= _scrollCtrl.position.maxScrollExtent - 80;
@@ -1013,26 +1050,33 @@ class _ConversationPageState extends State<_ConversationPage> {
         .snapshots()
         .listen((snap) async {
       bool changed = false;
+      const reviewedStatuses = {'verified', 'validated', 'trained', 'rejected'};
 
-      // Build the set of messageIds still present in Firestore
       final activeMessageIds = <String>{};
       for (final doc in snap.docs) {
-        final data    = doc.data() as Map<String, dynamic>;
-        final msgTime = (data['messageId'] ?? data['messageTime'] ?? '').toString();
-        final status  = data['status']?.toString() ?? 'under_review';
+        final data         = doc.data() as Map<String, dynamic>;
+        final msgTime      = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+        final status       = data['status']?.toString() ?? 'under_review';
+        final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
         if (msgTime.isNotEmpty) {
           activeMessageIds.add(msgTime);
           final prevStatus = _reportStatus[msgTime];
           if (prevStatus != status) {
             _reportStatus[msgTime] = status;
             changed = true;
+
+            // Apply label + move when a review decision just arrived
+            if (reviewedStatuses.contains(status) &&
+                !reviewedStatuses.contains(prevStatus ?? '')) {
+              await _applyReviewDecision(msgTime, status, originalLabel);
+            }
           }
         }
       }
 
       // Remove any messageIds that no longer exist in Firestore (deleted)
       final deletedKeys = _reportStatus.keys
-          .where((k) => !activeMessageIds.contains(k))
+          .where((k) => !activeMessageIds.contains(k) && _reportStatus[k] != 'pending')
           .toList();
       for (final key in deletedKeys) {
         _reportStatus.remove(key);
@@ -1047,16 +1091,8 @@ class _ConversationPageState extends State<_ConversationPage> {
   }
 
   Future<void> _loadChatroomPrefs() async {
-    final prefs = await loadChatroomPrefs(widget.sender);
-    if (!mounted) return;
-    Color color = const Color(0xFF1A7A72);
-    for (final t in kThemes) {
-      if (t.key == prefs.theme) { color = t.color; break; }
-    }
-    setState(() {
-      _themeColor   = color;
-      _wallpaperKey = prefs.wallpaper;
-    });
+    // Spam conversations always use the '8' wallpaper (no customization).
+    if (mounted) setState(() => _wallpaperKey = widget.spamFolderEnabled ? kSpamWallpaperDefault : 'background');
   }
 
   Color _wallpaperColorFromKey(String key) {
@@ -1134,7 +1170,7 @@ class _ConversationPageState extends State<_ConversationPage> {
 
       entry['verifiedByCrew'] = true;
       final bool wasPhishing = originalLabel == 'phishing';
-      final bool verified    = status == 'verified';
+      final bool verified    = status == 'verified' || status == 'validated';
       final String finalLabel = verified
           ? (wasPhishing ? 'Safe' : 'Phishing')
           : (wasPhishing ? 'Phishing' : 'Safe');
@@ -1356,6 +1392,199 @@ class _ConversationPageState extends State<_ConversationPage> {
     );
   }
 
+  void _showAlreadyReviewedDialog(
+      BuildContext ctx,
+      ReportModel report, {
+        bool spamEnabled = false,
+      }) {
+    final isValidated          = report.status == ReportStatus.validated;
+    final color                = isValidated ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+    final wasOriginallyPhishing = report.originalLabel.toLowerCase() == 'phishing';
+    final reportedAsLabel      = wasOriginallyPhishing ? 'Safe' : 'Phishing';
+
+    final String actionTaken;
+    if (isValidated) {
+      if (wasOriginallyPhishing) {
+        actionTaken = 'Label updated to Safe — Moved to inbox';
+      } else {
+        actionTaken = spamEnabled
+            ? 'Label updated to Phishing — Moved to spam'
+            : 'Label updated to Phishing.';
+      }
+    } else {
+      actionTaken = wasOriginallyPhishing
+          ? 'Label remains Phishing.'
+          : 'Label remains Safe.';
+    }
+
+    showDialog(
+      context: ctx,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(.4),
+      builder: (dlgCtx) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFFF6F4EC),
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [BoxShadow(
+                color: Colors.black.withOpacity(.15),
+                blurRadius: 24,
+                offset: const Offset(0, 8))],
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
+              child: Row(children: [
+                Icon(isValidated ? Icons.check_circle : Icons.cancel,
+                    color: color, size: 28),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text('Report Reviewed',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                ),
+              ]),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: color.withOpacity(.2)),
+                ),
+                child: Text(
+                  report.message.length > 120
+                      ? '${report.message.substring(0, 120)}…'
+                      : report.message,
+                  style: const TextStyle(
+                      fontSize: 13, color: Color(0xFF333333), height: 1.5),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Column(children: [
+                _dialogDetailRow('Reported as:', reportedAsLabel, bold: true),
+                const SizedBox(height: 8),
+                _dialogDetailRow('Report Status:',
+                    isValidated ? 'Accepted' : 'Rejected',
+                    valueColor: color,
+                    valueIcon: isValidated
+                        ? Icons.check_circle
+                        : Icons.cancel_outlined),
+                const SizedBox(height: 8),
+                _dialogDetailRow('Action taken:', actionTaken),
+              ]),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+              child: Column(children: [
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(dlgCtx);
+                      final wasPhishing = report.originalLabel.toLowerCase() == 'phishing';
+                      final isValidated = report.status == ReportStatus.validated;
+                      // validated+wasPhishing = moved to inbox (safe)
+                      // validated+!wasPhishing = moved to spam (phishing)
+                      final movedToInbox = isValidated && wasPhishing;
+                      final movedToSpam  = isValidated && !wasPhishing;
+
+                      if (movedToInbox || movedToSpam) {
+                        // Message was moved — navigate to where it now lives
+                        // Pop back to root inbox first, then open conversation
+                        Navigator.of(context).popUntil((route) => route.isFirst);
+                        Future.delayed(const Duration(milliseconds: 300), () {
+                          // Use the root-level openConversation via scaffold key
+                          final rootState = context.findAncestorStateOfType<_IOSMessagesPageState>();
+                          rootState?._openConversationFromReport(report.sender, report.message);
+                        });
+                      } else {
+                        // Message stayed here — just scroll and highlight
+                        setState(() => _reportHighlightTime = widget.messages
+                            .firstWhere(
+                              (m) => (m['message'] ?? '').toString().trim() ==
+                              report.message.trim(),
+                          orElse: () => {},
+                        )['time']?.toString());
+                        Future.delayed(const Duration(milliseconds: 200), () {
+                          if (mounted) _scrollToHighlightedMessage();
+                        });
+                      }
+                    },
+                    icon: const Icon(Icons.arrow_forward_rounded, size: 18),
+                    label: const Text('Go to message',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w600, fontSize: 15)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: color,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dlgCtx),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: color,
+                      side: BorderSide(color: color.withOpacity(.5)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    child: const Text('Got it',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w600, fontSize: 15)),
+                  ),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // Helper for detail rows inside the already-reviewed dialog
+  Widget _dialogDetailRow(String label, String value,
+      {bool bold = false, Color? valueColor, IconData? valueIcon}) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 110,
+          child: Text(label,
+              style: const TextStyle(fontSize: 13, color: Color(0xFF888888))),
+        ),
+        Expanded(
+          child: Row(children: [
+            if (valueIcon != null) ...[
+              Icon(valueIcon, size: 14, color: valueColor),
+              const SizedBox(width: 4),
+            ],
+            Expanded(
+              child: Text(value,
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+                      color: valueColor ?? Colors.black87)),
+            ),
+          ]),
+        ),
+      ],
+    );
+  }
+
   // ── Redesigned Confirm Report / Report sheet ──────────────────────────────
 
   void _showReportSheet(BuildContext ctx, int index) {
@@ -1505,143 +1734,79 @@ class _ConversationPageState extends State<_ConversationPage> {
                                     style: TextStyle(color: Color(0xFF888888), fontWeight: FontWeight.w500)),
                               ),
                               ElevatedButton(
-                                onPressed: () {
+                                onPressed: () async {
                                   final msgTime = msg['time']?.toString() ?? '';
                                   Navigator.pop(confirmCtx);
                                   Navigator.pop(dlgCtx);
 
                                   final messageHash = sha256
-                                      .convert(utf8.encode(msg['message']?.toString() ?? ''))
+                                      .convert(utf8.encode((msg['message']?.toString() ?? '').toLowerCase().trim()))
                                       .toString();
 
-                                  FirebaseFirestore.instance
-                                      .collection('model_feedback')
-                                      .where('messageHash', isEqualTo: messageHash)
-                                      .get()
-                                      .then((existing) {
+                                  () async {
+                                    final existing = await FirebaseFirestore.instance
+                                        .collection('model_feedback')
+                                        .where('messageHash', isEqualTo: messageHash)
+                                        .get();
                                     if (!mounted) return;
 
                                     if (existing.docs.isNotEmpty) {
                                       final doc = existing.docs.first.data();
                                       final status = doc['status']?.toString() ?? '';
+                                      final existingReportId = existing.docs.first.id;
                                       const reviewedStatuses = ['trained', 'verified', 'validated', 'rejected'];
 
                                       if (reviewedStatuses.contains(status)) {
                                         setState(() => _reportStatus[msgTime] = status);
-                                        _saveStatus();
-                                        final isAccepted = status == 'verified' || status == 'validated' || status == 'trained';
-                                        final color = isAccepted ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
-                                        final actionTaken = isPhishing
-                                            ? (isAccepted ? 'Label updated to Safe.' : 'Label remains Phishing.')
-                                            : (isAccepted ? 'Label updated to Phishing.' : 'Label remains Safe.');
-                                        showDialog(
-                                          context: ctx,
-                                          barrierDismissible: false,
-                                          barrierColor: Colors.black.withOpacity(.4),
-                                          builder: (reviewedCtx) => Dialog(
-                                            backgroundColor: Colors.transparent,
-                                            child: Container(
-                                              decoration: BoxDecoration(
-                                                color: const Color(0xFFF6F4EC),
-                                                borderRadius: BorderRadius.circular(24),
-                                                boxShadow: [BoxShadow(color: Colors.black.withOpacity(.15), blurRadius: 24, offset: const Offset(0, 8))],
-                                              ),
-                                              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                                                // ── Header ──
-                                                Padding(
-                                                  padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
-                                                  child: Row(children: [
-                                                    Icon(isAccepted ? Icons.check_circle : Icons.cancel, color: color, size: 28),
-                                                    const SizedBox(width: 10),
-                                                    const Expanded(
-                                                      child: Text('Already Reviewed',
-                                                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                                                    ),
-                                                  ]),
-                                                ),
-                                                // ── Message preview ──
-                                                Padding(
-                                                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-                                                  child: Container(
-                                                    width: double.infinity,
-                                                    padding: const EdgeInsets.all(14),
-                                                    decoration: BoxDecoration(
-                                                      color: color.withOpacity(.08),
-                                                      borderRadius: BorderRadius.circular(14),
-                                                      border: Border.all(color: color.withOpacity(.2)),
-                                                    ),
-                                                    child: Text(
-                                                      (msg['message']?.toString() ?? '').length > 120
-                                                          ? '${(msg['message']?.toString() ?? '').substring(0, 120)}…'
-                                                          : msg['message']?.toString() ?? '',
-                                                      style: const TextStyle(fontSize: 13, color: Color(0xFF333333), height: 1.5),
-                                                    ),
-                                                  ),
-                                                ),
-                                                // ── Details rows ──
-                                                Padding(
-                                                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-                                                  child: Column(children: [
-                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                                      const SizedBox(width: 110, child: Text('Reported as:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
-                                                      Expanded(child: Text(isPhishing ? 'Phishing' : 'Safe',
-                                                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.black87))),
-                                                    ]),
-                                                    const SizedBox(height: 8),
-                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                                      const SizedBox(width: 110, child: Text('Report Status:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
-                                                      Row(children: [
-                                                        Icon(isAccepted ? Icons.check_circle : Icons.cancel_outlined, size: 14, color: color),
-                                                        const SizedBox(width: 4),
-                                                        Text(isAccepted ? 'Accepted' : 'Rejected',
-                                                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: color)),
-                                                      ]),
-                                                    ]),
-                                                    const SizedBox(height: 8),
-                                                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                                      const SizedBox(width: 110, child: Text('Action taken:', style: TextStyle(fontSize: 13, color: Color(0xFF888888)))),
-                                                      Expanded(child: Text(actionTaken,
-                                                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.black87))),
-                                                    ]),
-                                                  ]),
-                                                ),
-                                                // ── Got it button ──
-                                                Padding(
-                                                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
-                                                  child: SizedBox(
-                                                    width: double.infinity,
-                                                    child: ElevatedButton(
-                                                      onPressed: () => Navigator.pop(reviewedCtx),
-                                                      style: ElevatedButton.styleFrom(
-                                                        backgroundColor: color,
-                                                        foregroundColor: Colors.white,
-                                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                                                        elevation: 0,
-                                                        padding: const EdgeInsets.symmetric(vertical: 14),
-                                                      ),
-                                                      child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
-                                                    ),
-                                                  ),
-                                                ),
-                                              ]),
-                                            ),
-                                          ),
+                                        await _saveStatus();
+                                        final currentLabel = (doc['originalLabel'] ?? '').toString().toLowerCase() == 'phishing'
+                                            ? 'phishing' : 'legitimate';
+                                        await _applyReviewDecision(msgTime, status, currentLabel);
+                                        final p2 = await SharedPreferences.getInstance();
+                                        final spamEnabled = p2.getBool('spam_folder_enabled') ?? false;
+
+                                        // Mark this report as unviewed so the NEW badge appears
+                                        final viewedRaw = p2.getString('viewed_report_ids');
+                                        final viewed = viewedRaw != null && viewedRaw.isNotEmpty
+                                            ? (jsonDecode(viewedRaw) as List).cast<String>().toSet()
+                                            : <String>{};
+                                        viewed.remove(existingReportId);
+                                        await p2.setString('viewed_report_ids', jsonEncode(viewed.toList()));
+
+                                        final tempReport = ReportModel(
+                                          reportId      : existingReportId,
+                                          message       : msg['message']?.toString() ?? '',
+                                          originalLabel : currentLabel,
+                                          correctedLabel: currentLabel == 'phishing' ? 'legitimate' : 'phishing',
+                                          confidence    : 0,
+                                          reason        : doc['reason']?.toString() ?? '',
+                                          status        : status == 'rejected'
+                                              ? ReportStatus.rejected
+                                              : ReportStatus.validated,
+                                          reportedAt    : DateTime.now(),
+                                          type          : 'inaccurate_report',
                                         );
+                                        if (mounted) {
+                                          // Show the full review dialog with Go to message
+                                          _showAlreadyReviewedDialog(
+                                            ctx,
+                                            tempReport,
+                                            spamEnabled: spamEnabled,
+                                          );
+                                        }
                                         return;
                                       }
                                       // Still pending
-                                      setState(() => _reportStatus[msgTime] = 'pending');
-                                      _saveStatus();
-                                      _showVerificationDialog(ctx);
+                                      if (mounted) setState(() => _reportStatus[msgTime] = 'pending');
+                                      await _saveStatus();
+                                      if (mounted) _showVerificationDialog(ctx);
                                       return;
                                     }
 
                                     // Fresh report
-                                    setState(() => _reportStatus[msgTime] = 'pending');
-                                    _saveStatus();
-                                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                                      if (mounted) _showVerificationDialog(ctx);
-                                    });
+                                    if (mounted) setState(() => _reportStatus[msgTime] = 'pending');
+                                    await _saveStatus();
+                                    if (mounted) _showVerificationDialog(ctx);
                                     submitReport(
                                       messageBody: msg['message']?.toString() ?? '',
                                       originalLabel: isPhishing ? 'phishing' : 'legitimate',
@@ -1652,7 +1817,7 @@ class _ConversationPageState extends State<_ConversationPage> {
                                       messageId: msg['time']?.toString() ?? '',
                                       source: 'inbox',
                                     );
-                                  });
+                                  }();
                                 },
                                 style: ElevatedButton.styleFrom(   // keep your existing style unchanged
                                   backgroundColor: const Color(0xFFF2554F),
@@ -2130,7 +2295,7 @@ class _ConversationPageState extends State<_ConversationPage> {
           decoration: BoxDecoration(
             color: isSelected
                 ? const Color(0xFFD0EAE6)
-                : (displayPhishing ? const Color(0xFFFFE8E8) : const Color(0xFFD6F0E8)),
+                : (displayPhishing ? const Color(0xFFFFCDD2) : const Color(0xFFD6F0E8)),
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(4),
               topRight: Radius.circular(18),
@@ -2809,6 +2974,7 @@ class SpamFolderPage extends StatefulWidget {
   final String deviceId;
   final VoidCallback? onOpenReportTracker;
   final bool spamEnabled;
+  final void Function(String sender, String messageBody)? onOpenConversation;
 
   const SpamFolderPage({
     super.key,
@@ -2816,6 +2982,7 @@ class SpamFolderPage extends StatefulWidget {
     required this.deviceId,
     required this.spamEnabled,
     this.onOpenReportTracker,
+    this.onOpenConversation,
   });
 
   @override
@@ -2857,6 +3024,20 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
     _startSpamReportBadgeListener();
   }
 
+  Widget _dialogDetailRow(String label, String value,
+      {bool bold = false, Color? valueColor, IconData? valueIcon}) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(width: 110, child: Text(label, style: const TextStyle(fontSize: 13, color: Color(0xFF888888)))),
+        Expanded(child: Row(children: [
+          if (valueIcon != null) ...[Icon(valueIcon, size: 14, color: valueColor), const SizedBox(width: 4)],
+          Expanded(child: Text(value, style: TextStyle(fontSize: 13, fontWeight: bold ? FontWeight.w700 : FontWeight.w500, color: valueColor ?? Colors.black87))),
+        ])),
+      ],
+    );
+  }
+
   Widget _highlightSearchText(String text, String query) {
     if (query.isEmpty) return buildPhishingHighlightedText(text);
     final lower = text.toLowerCase();
@@ -2891,11 +3072,20 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
     _spamReportBadgeSub = FirebaseFirestore.instance
         .collection('model_feedback')
         .snapshots()
-        .listen((snap) {
+        .listen((snap) async {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString('viewed_report_ids');
+      final viewed = raw != null && raw.isNotEmpty
+          ? (jsonDecode(raw) as List).cast<String>().toSet()
+          : <String>{};
+      const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
       final count = snap.docs.where((doc) {
-        final data = doc.data() as Map<String, dynamic>;
+        final data   = doc.data() as Map<String, dynamic>;
         final status = data['status']?.toString() ?? '';
-        return status == 'pending' || status == 'under_review';
+        final src    = (data['source'] ?? 'inbox').toString();
+        return reviewedStatuses.contains(status)
+            && src == 'spam'
+            && !viewed.contains(doc.id);
       }).length;
       if (mounted) setState(() => _spamReportCount = count);
     }, onError: (e) => debugPrint('Spam report badge error: $e'));
@@ -2903,6 +3093,32 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
   void _startReviewListener() {
     _reviewSub?.cancel();
+    final Map<String, String> _prevStatuses = {};
+    _reviewSub = FirebaseFirestore.instance
+        .collection('model_feedback')
+        .snapshots()
+        .listen((snap) async {
+      const reviewedStatuses = {'verified', 'validated', 'trained', 'rejected'};
+      for (final doc in snap.docs) {
+        final data = doc.data() as Map<String, dynamic>;
+        final status = data['status']?.toString() ?? '';
+        final src = (data['source'] ?? 'inbox').toString();
+        final msgTime = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+        final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+        final prevStatus = _prevStatuses[doc.id];
+
+        if (src == 'spam' &&
+            reviewedStatuses.contains(status) &&
+            !reviewedStatuses.contains(prevStatus ?? '')) {
+          // New review decision just arrived — apply the move
+          if (msgTime.isNotEmpty) {
+            await _applyReviewDecision(msgTime, status, originalLabel);
+          }
+        }
+        _prevStatuses[doc.id] = status;
+      }
+      await _loadSpam();
+    });
   }
 
   Future<void> _saveStatus() async {
@@ -2940,7 +3156,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
       entry['verifiedByCrew'] = true;
       final bool wasPhishing  = originalLabel == 'phishing';
-      final bool verified     = status == 'verified';
+      final bool verified     = status == 'verified' || status == 'validated';
       final String finalLabel = verified
           ? (wasPhishing ? 'Safe' : 'Phishing')
           : (wasPhishing ? 'Phishing' : 'Safe');
@@ -3227,22 +3443,41 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                     const SizedBox(width: 12),
                     Expanded(
                       child: ElevatedButton(
-                        onPressed: () {
+                        onPressed: () async {
                           Navigator.pop(dlgCtx);
-                          onReported?.call();
-                          _showVerificationDialog(ctx);
                           final msgs   = _spamMessages.where((m) => (m['sender'] ?? '') == sender).toList();
                           final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
+                          final msgBody = sample['message']?.toString() ?? '';
+                          final msgTime = sample['time']?.toString() ?? '';
+                          final messageHash = sha256.convert(utf8.encode(msgBody.toLowerCase().trim())).toString();
+                          final existing = await FirebaseFirestore.instance
+                              .collection('model_feedback')
+                              .where('messageHash', isEqualTo: messageHash)
+                              .get();
+                          const reviewedStatuses = ['trained', 'verified', 'validated', 'rejected'];
+                          if (existing.docs.isNotEmpty) {
+                            final doc = existing.docs.first.data();
+                            final status = doc['status']?.toString() ?? '';
+                            if (reviewedStatuses.contains(status)) {
+                              // Don't re-apply — the label is already correct in local storage.
+                              // Just read the current actual label and show the dialog.
+                              final currentLabel = (doc['originalLabel'] ?? sample['label'] ?? 'phishing').toString().toLowerCase() == 'phishing' ? 'phishing' : 'legitimate';
+                              await _loadSpam();
+                              return;
+                            }
+                          }
+                          onReported?.call();
+                          _showVerificationDialog(ctx);
                           _submitReport(
                             sender       : sender,
-                            message      : sample['message']?.toString() ?? '',
+                            message      : msgBody,
                             originalLabel: 'Phishing',
                             confidence   : ((sample['confidence'] as num?)?.toDouble() ?? 0.0),
                             reason       : selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
                             type         : 'inaccurate_detection',
                             source       : widget.spamEnabled ? 'spam' : 'inbox',
                             deviceId     : widget.deviceId,
-                            messageTime  : sample['time']?.toString() ?? '',
+                            messageTime  : msgTime,
                           );
                         },
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF2554F), foregroundColor: Colors.white,
@@ -3360,18 +3595,169 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                     style: TextStyle(color: Color(0xFF888888), fontWeight: FontWeight.w500)),
                               ),
                               ElevatedButton(
-                                onPressed: () {
-                                  Navigator.pop(confirmCtx);
-                                  Navigator.pop(dlgCtx);
-                                  onReported?.call();
-                                  _showVerificationDialog(ctx);
+                                onPressed: () async {
                                   final msgs   = _spamMessages.where((m) => (m['sender'] ?? '') == sender).toList();
                                   final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
+                                  final msgBody = sample['message']?.toString() ?? '';
+                                  final msgTime = sample['time']?.toString() ?? '';
+                                  final messageHash = sha256.convert(utf8.encode(msgBody.toLowerCase().trim())).toString();
+                                  final existing = await FirebaseFirestore.instance
+                                      .collection('model_feedback')
+                                      .where('messageHash', isEqualTo: messageHash)
+                                      .get();
+                                  Navigator.pop(confirmCtx);
+                                  Navigator.pop(dlgCtx);
+                                  const reviewedStatuses = ['trained', 'verified', 'validated', 'rejected'];
+                                  if (existing.docs.isNotEmpty) {
+                                    final doc = existing.docs.first.data();
+                                    final status = doc['status']?.toString() ?? '';
+                                    if (reviewedStatuses.contains(status)) {
+                                      // Don't re-apply — the label is already correct in local storage.
+                                      // Just read the current actual label and show the dialog.
+                                      final currentLabel = (doc['originalLabel'] ?? sample['label'] ?? 'phishing').toString().toLowerCase() == 'phishing' ? 'phishing' : 'legitimate';
+                                      await _loadSpam();
+
+                                      final p2 = await SharedPreferences.getInstance();
+                                      final existingReportId = existing.docs.first.id;
+                                      final spamEnabled = p2.getBool('spam_folder_enabled') ?? false;
+
+                                      final viewedRaw = p2.getString('viewed_report_ids');
+                                      final viewed = viewedRaw != null && viewedRaw.isNotEmpty
+                                          ? (jsonDecode(viewedRaw) as List).cast<String>().toSet()
+                                          : <String>{};
+                                      viewed.remove(existingReportId);
+                                      await p2.setString('viewed_report_ids', jsonEncode(viewed.toList()));
+
+                                      final tempReport = ReportModel(
+                                        reportId      : existingReportId,
+                                        message       : msgBody,
+                                        originalLabel : currentLabel,
+                                        correctedLabel: currentLabel,
+                                        confidence    : 0,
+                                        reason        : doc['reason']?.toString() ?? '',
+                                        status        : ReportStatus.validated,
+                                        reportedAt    : DateTime.now(),
+                                        type          : 'inaccurate_report',
+                                      );
+
+                                      if (mounted) {
+                                        // Find the _SpamConversationPageState to show the dialog
+                                        if (mounted) {
+                                          showDialog(
+                                            context: context,
+                                            barrierDismissible: false,
+                                            barrierColor: Colors.black.withOpacity(.4),
+                                            builder: (dlgCtx) {
+                                              final isValidated = tempReport.status == ReportStatus.validated;
+                                              final color = isValidated ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+                                              final wasOriginallyPhishing = tempReport.originalLabel.toLowerCase() == 'phishing';
+                                              final reportedAsLabel = wasOriginallyPhishing ? 'Safe' : 'Phishing';
+                                              final String actionTaken = wasOriginallyPhishing
+                                                  ? 'Label remains Phishing — already reviewed.'
+                                                  : 'Label remains Safe — already reviewed.';
+
+                                              return Dialog(
+                                                backgroundColor: Colors.transparent,
+                                                child: Container(
+                                                  decoration: BoxDecoration(
+                                                    color: const Color(0xFFF6F4EC),
+                                                    borderRadius: BorderRadius.circular(24),
+                                                    boxShadow: [BoxShadow(color: Colors.black.withOpacity(.15), blurRadius: 24, offset: const Offset(0, 8))],
+                                                  ),
+                                                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                                    Padding(
+                                                      padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
+                                                      child: Row(children: [
+                                                        Icon(isValidated ? Icons.check_circle : Icons.cancel, color: color, size: 28),
+                                                        const SizedBox(width: 10),
+                                                        const Expanded(child: Text('Report Reviewed', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700))),
+                                                      ]),
+                                                    ),
+                                                    Padding(
+                                                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+                                                      child: Container(
+                                                        width: double.infinity,
+                                                        padding: const EdgeInsets.all(14),
+                                                        decoration: BoxDecoration(
+                                                          color: color.withOpacity(.08),
+                                                          borderRadius: BorderRadius.circular(14),
+                                                          border: Border.all(color: color.withOpacity(.2)),
+                                                        ),
+                                                        child: Text(
+                                                          tempReport.message.length > 120 ? '${tempReport.message.substring(0, 120)}…' : tempReport.message,
+                                                          style: const TextStyle(fontSize: 13, color: Color(0xFF333333), height: 1.5),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    Padding(
+                                                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                                                      child: Column(children: [
+                                                        _dialogDetailRow('Reported as:', reportedAsLabel, bold: true),
+                                                        const SizedBox(height: 8),
+                                                        _dialogDetailRow('Report Status:', isValidated ? 'Accepted' : 'Rejected', valueColor: color, valueIcon: isValidated ? Icons.check_circle : Icons.cancel_outlined),
+                                                        const SizedBox(height: 8),
+                                                        _dialogDetailRow('Action taken:', actionTaken),
+                                                      ]),
+                                                    ),
+                                                    Padding(
+                                                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                                                      child: Column(children: [
+                                                        SizedBox(
+                                                          width: double.infinity,
+                                                          child: ElevatedButton.icon(
+                                                            onPressed: () {
+                                                              Navigator.pop(dlgCtx);
+                                                              Navigator.of(context).popUntil((route) => route.isFirst);
+                                                              Future.delayed(const Duration(milliseconds: 300), () {
+                                                                widget.onOpenConversation?.call(tempReport.sender, tempReport.message);
+                                                              });
+                                                            },
+                                                            icon: const Icon(Icons.arrow_forward_rounded, size: 18),
+                                                            label: const Text('Go to message', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                                                            style: ElevatedButton.styleFrom(
+                                                              backgroundColor: color, foregroundColor: Colors.white,
+                                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                                              elevation: 0, padding: const EdgeInsets.symmetric(vertical: 14),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        const SizedBox(height: 10),
+                                                        SizedBox(
+                                                          width: double.infinity,
+                                                          child: OutlinedButton(
+                                                            onPressed: () => Navigator.pop(dlgCtx),
+                                                            style: OutlinedButton.styleFrom(
+                                                              foregroundColor: color,
+                                                              side: BorderSide(color: color.withOpacity(.5)),
+                                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                                              padding: const EdgeInsets.symmetric(vertical: 14),
+                                                            ),
+                                                            child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                                                          ),
+                                                        ),
+                                                      ]),
+                                                    ),
+                                                  ]),
+                                                ),
+                                              );
+                                            },
+                                          );
+                                        }
+                                      }
+                                      return;
+                                    }
+                                  }
+                                  onReported?.call();
+                                  _showVerificationDialog(ctx);
                                   _submitReport(
-                                    message      : sample['message']?.toString() ?? '',
+                                    message      : msgBody,
                                     originalLabel: 'phishing',
                                     confidence   : ((sample['confidence'] as num?)?.toDouble() ?? 0.0),
                                     reason       : selected == 'Other reason' ? otherCtrl.text.trim() : selected!,
+                                    source       : widget.spamEnabled ? 'spam' : 'inbox',
+                                    deviceId     : widget.deviceId,
+                                    sender       : sender,
+                                    messageTime  : msgTime,
                                   );
                                 },
                                 style: ElevatedButton.styleFrom(
@@ -3504,11 +3890,32 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
         title: const Text('Spam Folder',
             style: TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
         actions: [
-          if (_activeTab == 0 && !_loading && _spamMessages.isNotEmpty)
+          if (_activeTab == 0) ...[
             IconButton(
-                tooltip: 'Delete all',
-                icon: const Icon(Icons.delete_sweep_outlined),
-                onPressed: _deleteAll),
+              tooltip: 'Search',
+              icon: const Icon(Icons.search),
+              onPressed: () {
+                showSearch(
+                  context: context,
+                  delegate: _SpamSearchDelegate(
+                    threads: _threads,
+                    formatTime: widget.formatTime,
+                    deviceId: widget.deviceId,
+                    onRestore: _restoreToInbox,
+                    onDelete: _deleteFromSpam,
+                    onConfirmDelete: _confirmDelete,
+                    onReport: (sender, onReported) =>
+                        _showReportSheet(context, sender, onReported),
+                  ),
+                );
+              },
+            ),
+            if (!_loading && _spamMessages.isNotEmpty)
+              IconButton(
+                  tooltip: 'Delete all',
+                  icon: const Icon(Icons.delete_sweep_outlined),
+                  onPressed: _deleteAll),
+          ],
         ],
       ),
       body: SafeArea(
@@ -3613,48 +4020,70 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                     onDelete: () => _deleteFromSpam(sender),
                                     onConfirmDelete: () => _confirmDelete(sender),
                                     onReport: (onReported) =>
-                                        _showReportSheet(ctx, sender, onReported),
+                                        _showReportSheet(context, sender, onReported),
                                     deviceId: widget.deviceId,
+                                    spamEnabled: widget.spamEnabled,
                                   ))).then((_) => _loadSpam()),
                           child: Padding(
                             padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              // Avatar with red border
                               Container(
-                                  width: 46, height: 46,
-                                  decoration: BoxDecoration(
-                                      color: const Color(0xFFE8E4DA),
-                                      borderRadius: BorderRadius.circular(23)),
-                                  child: const Icon(Icons.person,
-                                      color: Color(0xFF999999), size: 26)),
+                                width: 46, height: 46,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFEDE8DF),
+                                  borderRadius: BorderRadius.circular(23),
+                                  border: Border.all(
+                                      color: const Color(0xFFF2554F).withOpacity(.5),
+                                      width: 1.5),
+                                ),
+                                child: const Icon(Icons.person,
+                                    color: Color(0xFF999999), size: 26),
+                              ),
                               const SizedBox(width: 12),
                               Expanded(
                                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                                   Row(children: [
                                     Expanded(
                                         child: Text(sender,
-                                            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                                            style: const TextStyle(
+                                                fontSize: 15, fontWeight: FontWeight.w600),
                                             overflow: TextOverflow.ellipsis)),
+                                    // Warning badge beside time
                                     if (count > 0)
                                       Container(
-                                          margin: const EdgeInsets.only(left: 6, right: 6),
-                                          width: 20, height: 20,
-                                          decoration: const BoxDecoration(
-                                              color: Color(0xFFF2554F), shape: BoxShape.circle),
-                                          child: Center(
-                                              child: Text(count > 9 ? '9+' : '$count',
-                                                  style: const TextStyle(
-                                                      color: Colors.white,
-                                                      fontSize: 10,
-                                                      fontWeight: FontWeight.w700)))),
+                                        margin: const EdgeInsets.only(right: 6),
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 7, vertical: 3),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFFF2554F).withOpacity(.15),
+                                          borderRadius: BorderRadius.circular(10),
+                                        ),
+                                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                          const Icon(Icons.warning_amber_rounded,
+                                              size: 11, color: Color(0xFFF2554F)),
+                                          const SizedBox(width: 3),
+                                          Text(
+                                            '$count',
+                                            style: const TextStyle(
+                                                color: Color(0xFFF2554F),
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w700),
+                                          ),
+                                        ]),
+                                      ),
                                     Text(time,
-                                        style: const TextStyle(fontSize: 12, color: Color(0xFF999999))),
+                                        style: const TextStyle(
+                                            fontSize: 12, color: Color(0xFF999999))),
                                   ]),
                                   const SizedBox(height: 3),
                                   Text((latest['message'] ?? '').toString(),
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
                                       style: const TextStyle(
-                                          fontSize: 13, color: Color(0xFF666666), height: 1.4)),
+                                          fontSize: 13,
+                                          color: Color(0xFF666666),
+                                          height: 1.4)),
                                 ]),
                               ),
                             ]),
@@ -3685,7 +4114,31 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
         child: Row(children: [
-          const Spacer(),
+          // Report count on the left
+          Expanded(
+            child: StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('model_feedback')
+                  .snapshots(),
+              builder: (context, snap) {
+                final count = snap.data?.docs.where((doc) {
+                  final data = doc.data() as Map<String, dynamic>;
+                  final status = data['status']?.toString() ?? '';
+                  return status == 'pending' || status == 'under_review';
+                }).length ?? 0;
+                return Text(
+                  count == 0
+                      ? 'No reports yet'
+                      : '$count inaccurate detection report${count == 1 ? '' : 's'}',
+                  style: const TextStyle(
+                      fontSize: 13,
+                      color: Color(0xFF888888),
+                      fontWeight: FontWeight.w500),
+                );
+              },
+            ),
+          ),
+          // Hide reviewed button on the right
           GestureDetector(
             onTap: () => setState(() => _hideReviewedSpam = !_hideReviewedSpam),
             child: Container(
@@ -3719,6 +4172,12 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
           child: ReportTrackerBody(
             deviceId: widget.deviceId,
             source: 'spam',
+            spamFolderEnabled: widget.spamEnabled,
+            onOpenConversation: (sender, messageBody) async {
+              Navigator.of(context).popUntil((route) => route.isFirst);
+              await Future.delayed(const Duration(milliseconds: 300));
+              widget.onOpenConversation?.call(sender, messageBody);
+            },
             onToggleHideReviewed: null,
             onHideReviewedChanged: null,
           ),
@@ -3811,6 +4270,127 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Spam Search Delegate
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SpamSearchDelegate extends SearchDelegate<String> {
+  final List<Map<String, dynamic>> threads;
+  final String Function(String?) formatTime;
+  final String deviceId;
+  final Future<void> Function(String) onRestore;
+  final Future<void> Function(String) onDelete;
+  final Future<bool> Function(String) onConfirmDelete;
+  final void Function(String sender, VoidCallback onReported) onReport;
+
+  _SpamSearchDelegate({
+    required this.threads,
+    required this.formatTime,
+    required this.deviceId,
+    required this.onRestore,
+    required this.onDelete,
+    required this.onConfirmDelete,
+    required this.onReport,
+  });
+
+  @override
+  String get searchFieldLabel => 'Search spam messages…';
+
+  @override
+  List<Widget> buildActions(BuildContext context) => [
+    if (query.isNotEmpty)
+      IconButton(
+        icon: const Icon(Icons.clear),
+        onPressed: () => query = '',
+      ),
+  ];
+
+  @override
+  Widget buildLeading(BuildContext context) => IconButton(
+    icon: const Icon(Icons.arrow_back),
+    onPressed: () => close(context, ''),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) => _buildList(context);
+
+  @override
+  Widget buildSuggestions(BuildContext context) => _buildList(context);
+
+  Widget _buildList(BuildContext context) {
+    final q = query.toLowerCase();
+    final results = threads.where((t) {
+      final sender = (t['sender'] as String).toLowerCase();
+      if (sender.contains(q)) return true;
+      final msgs = t['messages'] as List<Map<String, dynamic>>;
+      return msgs.any((m) =>
+          (m['message'] ?? '').toString().toLowerCase().contains(q));
+    }).toList();
+
+    if (results.isEmpty) {
+      return Center(
+        child: Text(q.isEmpty ? 'Type to search' : 'No results for "$query"',
+            style: const TextStyle(color: Color(0xFF888888))),
+      );
+    }
+
+    return ListView.separated(
+      itemCount: results.length,
+      separatorBuilder: (_, __) =>
+      const Divider(height: 1, color: Color(0xFFEEEBE0)),
+      itemBuilder: (ctx, i) {
+        final thread = results[i];
+        final sender = thread['sender'] as String;
+        final latest = thread['latest'] as Map<String, dynamic>;
+        final count = thread['count'] as int;
+        final time = formatTime(latest['time'] as String?);
+        final preview = (latest['message'] ?? '').toString();
+
+        return ListTile(
+          leading: Container(
+            width: 46,
+            height: 46,
+            decoration: BoxDecoration(
+              color: const Color(0xFFEDE8DF),
+              borderRadius: BorderRadius.circular(23),
+              border: Border.all(
+                  color: const Color(0xFFF2554F).withOpacity(.4), width: 1.5),
+            ),
+            child: const Icon(Icons.person, color: Color(0xFF999999), size: 26),
+          ),
+          title: Text(sender,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+          subtitle: Text(preview,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 13, color: Color(0xFF666666))),
+          trailing: Text(time,
+              style: const TextStyle(fontSize: 12, color: Color(0xFF999999))),
+          onTap: () {
+            close(context, sender);
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => _SpamConversationPage(
+                  messages: thread['messages'] as List<Map<String, dynamic>>,
+                  sender: sender,
+                  formatTime: formatTime,
+                  onRestore: () => onRestore(sender),
+                  onDelete: () => onDelete(sender),
+                  onConfirmDelete: () => onConfirmDelete(sender),
+                  onReport: (onReported) => onReport(sender, onReported),
+                  deviceId: deviceId,
+                  spamEnabled: true,
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Spam Conversation Page
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3823,6 +4403,7 @@ class _SpamConversationPage extends StatefulWidget {
   final Future<bool> Function() onConfirmDelete;
   final void Function(VoidCallback onReported) onReport;
   final String deviceId;
+  final bool spamEnabled;
   const _SpamConversationPage({
     required this.messages,
     required this.sender,
@@ -3832,6 +4413,7 @@ class _SpamConversationPage extends StatefulWidget {
     required this.onConfirmDelete,
     required this.onReport,
     required this.deviceId,
+    required this.spamEnabled,
   });
   @override
   State<_SpamConversationPage> createState() => _SpamConversationPageState();
@@ -3860,9 +4442,8 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   void initState() {
     super.initState();
     _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
-    _loadAndSyncStatus();
     _loadChatroomPrefs();
-    _startRealtimeListener();
+    _loadAndSyncStatus().then((_) => _startRealtimeListener());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _scrollCtrl.hasClients) {
         _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
@@ -3886,25 +4467,33 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
         .snapshots()
         .listen((snap) async {
       bool changed = false;
+      const reviewedStatuses = {'verified', 'validated', 'trained', 'rejected'};
 
       final activeMessageIds = <String>{};
       for (final doc in snap.docs) {
-        final data    = doc.data() as Map<String, dynamic>;
-        final msgTime = (data['messageId'] ?? data['messageTime'] ?? '').toString();
-        final status  = data['status']?.toString() ?? 'under_review';
+        final data          = doc.data() as Map<String, dynamic>;
+        final msgTime       = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+        final status        = data['status']?.toString() ?? 'under_review';
+        final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
         if (msgTime.isNotEmpty) {
           activeMessageIds.add(msgTime);
           final prevStatus = _reportStatus[msgTime];
           if (prevStatus != status) {
             _reportStatus[msgTime] = status;
             changed = true;
+
+            // Apply label + move when a review decision just arrived
+            if (reviewedStatuses.contains(status) &&
+                !reviewedStatuses.contains(prevStatus ?? '')) {
+              await _applyReviewDecision(msgTime, status, originalLabel);
+            }
           }
         }
       }
 
       // Remove deleted reports
       final deletedKeys = _reportStatus.keys
-          .where((k) => !activeMessageIds.contains(k))
+          .where((k) => !activeMessageIds.contains(k) && _reportStatus[k] != 'pending')
           .toList();
       for (final key in deletedKeys) {
         _reportStatus.remove(key);
@@ -3919,6 +4508,10 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   }
 
   Future<void> _loadChatroomPrefs() async {
+    if (widget.spamEnabled) {
+      if (mounted) setState(() => _wallpaperKey = '8');
+      return;
+    }
     final prefs = await loadChatroomPrefs(widget.sender);
     if (!mounted) return;
     Color color = const Color(0xFF1A7A72);
@@ -4034,7 +4627,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
       if (entry == null) return false;
       entry['verifiedByCrew'] = true;
       final bool wasPhishing     = originalLabel == 'phishing';
-      final bool verified        = status == 'verified';
+      final bool verified        = status == 'verified' || status == 'validated';
       final String finalLabel    = verified ? (wasPhishing ? 'Safe' : 'Phishing') : (wasPhishing ? 'Phishing' : 'Safe');
       entry['label'] = finalLabel;
       final bool shouldBeInInbox = finalLabel.toLowerCase() == 'safe';
@@ -4124,63 +4717,125 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   }
 
   void _showMessageOptions(BuildContext ctx, int origIdx) {
+    final msg = widget.messages[origIdx];
+    final message = (msg['message'] ?? '').toString();
+    final msgTime = msg['time']?.toString() ?? '';
+    final status = _reportStatus[msgTime];
+    final isUnderReview = status == 'pending' || status == 'under_review';
+
     showModalBottomSheet(
       context: ctx,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (_) => Container(
-        decoration: const BoxDecoration(color: Colors.white,
-            borderRadius: BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20))),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(width: 40, height: 4, margin: const EdgeInsets.symmetric(vertical: 12),
-              decoration: BoxDecoration(color: const Color(0xFFCCCCC0), borderRadius: BorderRadius.circular(2))),
-          _msgOption(Icons.text_fields_outlined, 'Select text', () { Navigator.pop(ctx); }),
-          _msgOption(Icons.star_outline, 'Star message', () { Navigator.pop(ctx); }),
-          _msgOption(Icons.move_to_inbox_outlined, 'Move to Inbox', () {
-            Navigator.pop(ctx);
-            widget.onRestore();
-            if (mounted) Navigator.pop(context);
-          }),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-            child: Builder(builder: (context) {
-              final msgTime = widget.messages[origIdx]['time']?.toString() ?? '';
-              final status = _reportStatus[msgTime];
-              final isUnderReview = status == 'pending' || status == 'under_review';
-              return OutlinedButton.icon(
-                onPressed: isUnderReview ? null : () {
-                  Navigator.pop(ctx);
-                  widget.onReport(() {
-                    setState(() {
-                      for (final msg in widget.messages) {
-                        final t = msg['time']?.toString() ?? '';
-                        if (t.isNotEmpty) _reportStatus[t] = 'pending';
-                      }
-                    });
-                  });
-                },
-                icon: Icon(Icons.flag_outlined,
-                    color: isUnderReview ? const Color(0xFFBBBBBB) : const Color(0xFFF2554F)),
-                label: Text(
-                  isUnderReview ? 'Already Under Review' : 'Report Inaccurate Detection',
-                  style: TextStyle(
-                      color: isUnderReview ? const Color(0xFFBBBBBB) : const Color(0xFFF2554F),
-                      fontWeight: FontWeight.w600),
-                ),
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 50),
-                  side: BorderSide(color: isUnderReview ? const Color(0xFFDDDDDD) : const Color(0xFFF2554F)),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                ),
-              );
-            }),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: Radius.circular(20),
+            topRight: Radius.circular(20),
           ),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 40, height: 4,
+            margin: const EdgeInsets.symmetric(vertical: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFCCCCC0),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+
+          // View details
+          _sheetActionTile(
+            icon: Icons.info_outline,
+            iconColor: const Color(0xFF1A7A72),
+            label: 'View details',
+            onTap: () {
+              Navigator.pop(ctx);
+              _showMessageDetails(ctx, origIdx);
+            },
+          ),
+
+          // Restore to Inbox
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            child: OutlinedButton.icon(
+              onPressed: () {
+                Navigator.pop(ctx);
+                widget.onRestore();
+                if (mounted) Navigator.pop(context);
+              },
+              icon: const Icon(Icons.move_to_inbox_outlined,
+                  color: Color(0xFF1A7A72)),
+              label: const Text('Restore to Inbox',
+                  style: TextStyle(
+                      color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(double.infinity, 50),
+                side: const BorderSide(color: Color(0xFF1A7A72)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
+
+          // Report Inaccurate Detection
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+            child: OutlinedButton.icon(
+              onPressed: isUnderReview
+                  ? null
+                  : () {
+                Navigator.pop(ctx);
+                widget.onReport(() {
+                  setState(() {
+                    for (final m in widget.messages) {
+                      final t = m['time']?.toString() ?? '';
+                      if (t.isNotEmpty) _reportStatus[t] = 'pending';
+                    }
+                  });
+                });
+              },
+              icon: Icon(Icons.flag_outlined,
+                  color: isUnderReview
+                      ? const Color(0xFFBBBBBB)
+                      : const Color(0xFFF2554F)),
+              label: Text(
+                isUnderReview
+                    ? 'Already Under Review'
+                    : 'Report Inaccurate Detection',
+                style: TextStyle(
+                    color: isUnderReview
+                        ? const Color(0xFFBBBBBB)
+                        : const Color(0xFFF2554F),
+                    fontWeight: FontWeight.w600),
+              ),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(double.infinity, 50),
+                side: BorderSide(
+                    color: isUnderReview
+                        ? const Color(0xFFDDDDDD)
+                        : const Color(0xFFF2554F)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
+
           const Divider(height: 1),
+
+          // Bottom row: Copy / Share / Delete
           SafeArea(
             top: false,
             child: Row(children: [
-              _bottomAction(Icons.copy_outlined, 'Copy text', () { Navigator.pop(ctx); }),
-              _bottomAction(Icons.share_outlined, 'Share', () { Navigator.pop(ctx); }),
+              _bottomAction(Icons.copy_outlined, 'Copy text', () {
+                Clipboard.setData(ClipboardData(text: message));
+                Navigator.pop(ctx);
+              }),
+              _bottomAction(Icons.share_outlined, 'Share', () {
+                Navigator.pop(ctx);
+                Share.share(message);
+              }),
               _bottomAction(Icons.delete_outline, 'Delete', () async {
                 Navigator.pop(ctx);
                 if (await widget.onConfirmDelete()) {
@@ -4192,6 +4847,208 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
           ),
         ]),
       ),
+    );
+  }
+
+  /// Compact icon+label row used inside the long-press sheet.
+  Widget _sheetActionTile({
+    required IconData icon,
+    required Color iconColor,
+    required String label,
+    required VoidCallback onTap,
+    Color? labelColor,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+        child: Row(children: [
+          Container(
+            width: 36, height: 36,
+            decoration: BoxDecoration(
+              color: iconColor.withOpacity(.1),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, color: iconColor, size: 20),
+          ),
+          const SizedBox(width: 16),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 15,
+                  color: labelColor ?? Colors.black87,
+                  fontWeight: FontWeight.w400)),
+        ]),
+      ),
+    );
+  }
+
+  void _showMessageDetails(BuildContext ctx, int index) {
+    final msg = widget.messages[index];
+    final message = (msg['message'] ?? '').toString();
+    final sender = widget.sender;
+    final timeRaw = msg['time']?.toString() ?? '';
+    final isPhishing = true; // spam folder messages are always phishing
+
+    String formattedDate = '';
+    String formattedTime = '';
+    try {
+      final dt = DateTime.parse(timeRaw).toLocal();
+      formattedDate = DateFormat('MMMM d, yyyy').format(dt);
+      formattedTime = DateFormat('h:mm a').format(dt);
+    } catch (_) {}
+
+    final rawConf = msg['confidence'];
+    final confidenceText = rawConf != null
+        ? '${(rawConf as num).toDouble().toStringAsFixed(1)}% confidence'
+        : '99.9% confidence';
+
+    final indicators = PhishingIndicator.detect(message, maxCount: 4);
+
+    showModalBottomSheet(
+      context: ctx,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius:
+          BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24)),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 40, height: 4,
+            margin: const EdgeInsets.symmetric(vertical: 12),
+            decoration: BoxDecoration(
+                color: const Color(0xFFCCCCCC), borderRadius: BorderRadius.circular(2)),
+          ),
+          ConstrainedBox(
+            constraints:
+            BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.85),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 4, 20, 32),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('Message Details',
+                    style: TextStyle(
+                        fontSize: 22, fontWeight: FontWeight.bold, color: Colors.black87)),
+                const SizedBox(height: 20),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFEBEE),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFFFFCDD2)),
+                  ),
+                  child: Row(children: [
+                    Container(
+                      width: 44, height: 44,
+                      decoration: const BoxDecoration(
+                          color: Color(0xFFFFCDD2), shape: BoxShape.circle),
+                      child: const Icon(Icons.warning_rounded,
+                          color: Color(0xFFD32F2F), size: 24),
+                    ),
+                    const SizedBox(width: 14),
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('Phishing Detected',
+                          style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFD32F2F))),
+                      const SizedBox(height: 2),
+                      Text(confidenceText,
+                          style: const TextStyle(
+                              fontSize: 13, color: Color(0xFFE57373))),
+                    ]),
+                  ]),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF5F5F5),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(children: [
+                    _detailRowNew(Icons.person_outline_rounded, 'Sender', sender),
+                    const Divider(height: 1, indent: 56, color: Color(0xFFE0E0E0)),
+                    _detailRowNew(Icons.access_time_rounded, 'Date & Time',
+                        '$formattedDate • $formattedTime'),
+                    const Divider(height: 1, indent: 56, color: Color(0xFFE0E0E0)),
+                    _detailRowNew(
+                        Icons.text_fields_rounded, 'Characters', message.length.toString()),
+                  ]),
+                ),
+                if (indicators.isNotEmpty) ...[
+                  const SizedBox(height: 24),
+                  Row(children: [
+                    Container(
+                        width: 4, height: 20,
+                        decoration: const BoxDecoration(
+                            color: Color(0xFFD32F2F),
+                            borderRadius: BorderRadius.all(Radius.circular(2)))),
+                    const SizedBox(width: 10),
+                    const Text('Why this was flagged',
+                        style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.black87)),
+                  ]),
+                  const SizedBox(height: 12),
+                  ...indicators.map((ind) => Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                    decoration: BoxDecoration(
+                      color: ind.color.withOpacity(0.07),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: ind.color.withOpacity(0.18)),
+                    ),
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Container(
+                        width: 42, height: 42,
+                        decoration: BoxDecoration(
+                          color: ind.color.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Icon(ind.icon, color: ind.color, size: 22),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                          child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(ind.label,
+                                    style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.bold,
+                                        color: ind.color)),
+                                const SizedBox(height: 4),
+                                Text(ind.description,
+                                    style: const TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.black54,
+                                        height: 1.4)),
+                              ])),
+                    ]),
+                  )),
+                ],
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _detailRowNew(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(children: [
+        Icon(icon, size: 22, color: const Color(0xFF9E9E9E)),
+        const SizedBox(width: 18),
+        Text(label, style: const TextStyle(fontSize: 14, color: Color(0xFF9E9E9E))),
+        const Spacer(),
+        Text(value,
+            style: const TextStyle(
+                fontSize: 14, fontWeight: FontWeight.w600, color: Colors.black87)),
+      ]),
     );
   }
 
@@ -4293,6 +5150,179 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
     return [{'label': 'Suspicious Message', 'icon': Icons.warning_amber_rounded}];
   }
 
+  void _showAlreadyReviewedDialog(
+      ReportModel report, {
+        bool spamEnabled = false,
+      }) {
+    final isValidated = report.status == ReportStatus.validated;
+    final color = isValidated ? const Color(0xFF1A7A72) : const Color(0xFFF2554F);
+    final wasOriginallyPhishing = report.originalLabel.toLowerCase() == 'phishing';
+    final reportedAsLabel = wasOriginallyPhishing ? 'Safe' : 'Phishing';
+
+    final String actionTaken;
+    if (isValidated) {
+      if (wasOriginallyPhishing) {
+        actionTaken = 'Label updated to Safe — Moved to inbox';
+      } else {
+        actionTaken = spamEnabled
+            ? 'Label updated to Phishing — Moved to spam'
+            : 'Label updated to Phishing.';
+      }
+    } else {
+      actionTaken = wasOriginallyPhishing
+          ? 'Label remains Phishing.'
+          : 'Label remains Safe.';
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withOpacity(.4),
+      builder: (dlgCtx) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFFF6F4EC),
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [BoxShadow(
+                color: Colors.black.withOpacity(.15),
+                blurRadius: 24,
+                offset: const Offset(0, 8))],
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
+              child: Row(children: [
+                Icon(isValidated ? Icons.check_circle : Icons.cancel,
+                    color: color, size: 28),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text('Report Reviewed',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                ),
+              ]),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: color.withOpacity(.2)),
+                ),
+                child: Text(
+                  report.message.length > 120
+                      ? '${report.message.substring(0, 120)}…'
+                      : report.message,
+                  style: const TextStyle(
+                      fontSize: 13, color: Color(0xFF333333), height: 1.5),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Column(children: [
+                _dialogDetailRow('Reported as:', reportedAsLabel, bold: true),
+                const SizedBox(height: 8),
+                _dialogDetailRow('Report Status:',
+                    isValidated ? 'Accepted' : 'Rejected',
+                    valueColor: color,
+                    valueIcon: isValidated
+                        ? Icons.check_circle
+                        : Icons.cancel_outlined),
+                const SizedBox(height: 8),
+                _dialogDetailRow('Action taken:', actionTaken),
+              ]),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+              child: Column(children: [
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(dlgCtx);
+                      Navigator.of(context).popUntil((route) => route.isFirst);
+                      Future.delayed(const Duration(milliseconds: 300), () {
+                        final rootState = context.findAncestorStateOfType<_IOSMessagesPageState>();
+                        rootState?._openConversationFromReport(report.sender, report.message);
+                      });
+                    },
+                    icon: const Icon(Icons.arrow_forward_rounded, size: 18),
+                    label: const Text('Go to message',
+                        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: color,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: () {
+                      Navigator.pop(dlgCtx);
+                      final wasPhishing = report.originalLabel.toLowerCase() == 'phishing';
+                      final movedToInbox = report.status == ReportStatus.validated && wasPhishing;
+                      if (movedToInbox) {
+                        Navigator.of(context).popUntil((route) => route.isFirst);
+                      }
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: color,
+                      side: BorderSide(color: color.withOpacity(.5)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    child: const Text('Got it',
+                        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                  ),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _dialogDetailRow(String label, String value,
+      {bool bold = false, Color? valueColor, IconData? valueIcon}) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 110,
+          child: Text(label,
+              style: const TextStyle(fontSize: 13, color: Color(0xFF888888))),
+        ),
+        Expanded(
+          child: Row(children: [
+            if (valueIcon != null) ...[
+              Icon(valueIcon, size: 14, color: valueColor),
+              const SizedBox(width: 4),
+            ],
+            Expanded(
+              child: Text(value,
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+                      color: valueColor ?? Colors.black87)),
+            ),
+          ]),
+        ),
+      ],
+    );
+  }
+
   // Add this method to _SpamConversationPageState
   Future<void> _saveStatus() async {
     final p = await SharedPreferences.getInstance();
@@ -4337,7 +5367,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                 ? const Color(0xFFD0EAE6)
                 : isReportHighlight
                 ? const Color(0xFFFFEC6E)
-                : (displayPhishing ? const Color(0xFFFFE8E8) : const Color(0xFFD6F0E8)),
+                : (displayPhishing ? const Color(0xFFFFCDD2) : const Color(0xFFD6F0E8)),
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(4),
               topRight: Radius.circular(18),
@@ -4463,8 +5493,23 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
           centerTitle: false,
           title: Text(widget.sender, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
           actions: [
-            if (!_searchActive)
-              IconButton(icon: const Icon(Icons.more_vert), onPressed: () => _showThreeDotMenu(ctx)),
+            if (!_searchActive) ...[
+              IconButton(
+                icon: const Icon(Icons.search),
+                tooltip: 'Search',
+                onPressed: () => setState(() => _searchActive = true),
+              ),
+              IconButton(
+                icon: const Icon(Icons.delete_outline),
+                tooltip: 'Delete conversation',
+                onPressed: () async {
+                  if (await widget.onConfirmDelete()) {
+                    widget.onDelete();
+                    if (mounted) Navigator.pop(context);
+                  }
+                },
+              ),
+            ],
           ],
         bottom: _searchActive
             ? PreferredSize(
@@ -4588,7 +5633,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                   margin: const EdgeInsets.only(left: 16, bottom: 10),
                   constraints: BoxConstraints(maxWidth: MediaQuery.of(ctx).size.width * 0.82),
                   decoration: BoxDecoration(
-                    color: isMatch ? const Color(0xFFFFF8E1) : (displayPhishing ? const Color(0xFFFFE8E8) : const Color(0xFFD6F0E8)),
+                    color: isMatch ? const Color(0xFFFFF8E1) : (displayPhishing ? const Color(0xFFFFCDD2) : const Color(0xFFD6F0E8)),
                     borderRadius: const BorderRadius.only(
                       topLeft: Radius.circular(4), topRight: Radius.circular(18),
                       bottomLeft: Radius.circular(18), bottomRight: Radius.circular(18),
@@ -4920,7 +5965,7 @@ class PhishingIndicator {
     return results.take(maxCount).toList();
   }
 
-  static bool _hasUrl(String t) => RegExp(r'https?://|bit\.ly|tinyurl|t\.co|\.com/|\.ph/').hasMatch(t);
+  static bool _hasUrl(String t) => RegExp(r'https?://|bit\.ly|tinyurl|t\.co|click.*link|tap.*link|link.*below').hasMatch(t);
   static bool _hasGamblingScam(String t) => RegExp(r'casino|slots|bet|jackpot|lotto|lucky spin|free spins|swerte').hasMatch(t);
   static bool _hasThreat(String t) => RegExp(r'arrest|warrant|legal action|court|suspend|terminated|blocked|deactivat').hasMatch(t);
   static bool _hasFear(String t) => RegExp(r'account.*clos|clos.*account|will be blocked|access.*revoked|service.*cut').hasMatch(t);

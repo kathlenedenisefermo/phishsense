@@ -88,6 +88,9 @@ const kWallpaperImages = [
   '1', '2', '3', '4', '5', '6', '7', '8',
 ];
 
+/// Default wallpaper key used by the spam folder conversations.
+const kSpamWallpaperDefault = '8';
+
 // ── Wallpaper color options ───────────────────────────────────────────────────
 const kWallpapers = [
   _WallpaperOption(key: 'default',  label: 'Default',  color: Color(0xFFF0EDE6), isDefault: true),

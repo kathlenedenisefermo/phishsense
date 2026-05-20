@@ -4612,7 +4612,11 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             // Apply label + move when a review decision just arrived
             if (reviewedStatuses.contains(status) &&
                 !reviewedStatuses.contains(prevStatus ?? '')) {
-              await _applyReviewDecision(msgTime, status, originalLabel);
+              final movedToInbox = await _applyReviewDecision(msgTime, status, originalLabel);
+              if (movedToInbox && mounted) {
+                Navigator.of(context).pop();
+                return;
+              }
             }
           }
         }

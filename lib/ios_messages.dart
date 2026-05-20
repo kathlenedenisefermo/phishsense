@@ -1854,7 +1854,7 @@ class _ConversationPageState extends State<_ConversationPage> {
                                   Navigator.pop(dlgCtx);
 
                                   final messageHash = sha256
-                                      .convert(utf8.encode((msg['message']?.toString() ?? '').toLowerCase().trim()))
+                                      .convert(utf8.encode(PhishingDetector.normalizeOtp(msg['message']?.toString() ?? '')))
                                       .toString();
 
                                   () async {
@@ -3590,7 +3590,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                           final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
                           final msgBody = sample['message']?.toString() ?? '';
                           final msgTime = sample['time']?.toString() ?? '';
-                          final messageHash = sha256.convert(utf8.encode(msgBody.toLowerCase().trim())).toString();
+                          final messageHash = sha256.convert(utf8.encode(PhishingDetector.normalizeOtp(msgBody))).toString();
                           final existing = await FirebaseFirestore.instance
                               .collection('model_feedback')
                               .where('messageHash', isEqualTo: messageHash)
@@ -3740,7 +3740,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                   final sample = msgs.isNotEmpty ? msgs.first : <String, dynamic>{};
                                   final msgBody = sample['message']?.toString() ?? '';
                                   final msgTime = sample['time']?.toString() ?? '';
-                                  final messageHash = sha256.convert(utf8.encode(msgBody.toLowerCase().trim())).toString();
+                                  final messageHash = sha256.convert(utf8.encode(PhishingDetector.normalizeOtp(msgBody))).toString();
                                   final existing = await FirebaseFirestore.instance
                                       .collection('model_feedback')
                                       .where('messageHash', isEqualTo: messageHash)

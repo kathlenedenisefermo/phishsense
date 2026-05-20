@@ -1285,7 +1285,8 @@ Future<void> submitReport({
 }) async {
   try {
     final messageHash = sha256
-        .convert(utf8.encode(messageBody.toLowerCase().trim()))
+        .convert(utf8.encode(
+            messageBody.toLowerCase().trim().replaceAll(RegExp(r'\b\d{4,8}\b'), '[code]')))
         .toString();
 
     final correctedLabel = originalLabel.toLowerCase() == 'phishing'

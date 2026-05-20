@@ -1,4 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,12 +203,21 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
 
   // ── Derived helpers ───────────────────────────────────────────────────────
 
+  static const _kGalleryPrefix = 'gallery_file:';
+
   bool get _hasUnsavedChanges =>
       _selectedWallpaper != _savedWallpaper ||
           _selectedTheme     != _savedTheme;
 
   Color get _currentThemeColor =>
       kThemes.firstWhere((t) => t.key == _selectedTheme).color;
+
+  bool get _isGalleryWallpaper =>
+      _selectedWallpaper.startsWith(_kGalleryPrefix);
+
+  String? get _galleryFilePath => _isGalleryWallpaper
+      ? _selectedWallpaper.substring(_kGalleryPrefix.length)
+      : null;
 
   String? get _currentWallpaperAsset =>
       kWallpaperImages.contains(_selectedWallpaper)
@@ -214,6 +227,27 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
   Color get _currentWallpaperColor {
     final match = kWallpapers.where((w) => w.key == _selectedWallpaper);
     return match.isNotEmpty ? match.first.color : const Color(0xFFF0EDE6);
+  }
+
+  // ── Gallery picker ────────────────────────────────────────────────────────
+
+  Future<void> _pickFromGallery() async {
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+    );
+    if (picked == null || !mounted) return;
+
+    // Copy to app documents so the path stays valid across sessions.
+    final docsDir  = await getApplicationDocumentsDirectory();
+    final wallDir  = Directory('${docsDir.path}/wallpapers');
+    if (!wallDir.existsSync()) wallDir.createSync(recursive: true);
+    final fileName = 'wallpaper_${DateTime.now().millisecondsSinceEpoch}.jpg';
+    final permanent = await File(picked.path).copy('${wallDir.path}/$fileName');
+
+    if (mounted) {
+      setState(() => _selectedWallpaper = '$_kGalleryPrefix${permanent.path}');
+    }
   }
 
   // ── Apply: this conversation ──────────────────────────────────────────────
@@ -437,9 +471,12 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          asset != null
-              ? Image.asset(asset, fit: BoxFit.cover)
-              : ColoredBox(color: _currentWallpaperColor),
+          if (_galleryFilePath != null)
+            Image.file(File(_galleryFilePath!), fit: BoxFit.cover)
+          else if (asset != null)
+            Image.asset(asset, fit: BoxFit.cover)
+          else
+            ColoredBox(color: _currentWallpaperColor),
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
             child: Column(
@@ -600,7 +637,7 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
 
       // Import from Gallery
       InkWell(
-        onTap: () {},
+        onTap: _pickFromGallery,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
           child: Row(children: [
@@ -700,74 +737,6 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
               ),
             );
           },
-        ),
-      ),
-
-      const SizedBox(height: 12),
-
-      // Color options
-      const Padding(
-        padding: EdgeInsets.fromLTRB(16, 0, 16, 10),
-        child: Text('Or choose a color:',
-            style: TextStyle(
-                fontSize: 13, color: Color(0xFF888888))),
-      ),
-
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: Wrap(
-          spacing: 14,
-          runSpacing: 14,
-          children: kWallpapers.map((opt) {
-            final isSelected = _selectedWallpaper == opt.key;
-            return GestureDetector(
-              onTap: () =>
-                  setState(() => _selectedWallpaper = opt.key),
-              child: Column(children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
-                  width: 52,
-                  height: 52,
-                  decoration: BoxDecoration(
-                    color: opt.color,
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: isSelected
-                          ? _currentThemeColor
-                          : const Color(0xFFCCCCCC),
-                      width: isSelected ? 2.5 : 1.5,
-                    ),
-                    boxShadow: isSelected
-                        ? [
-                      BoxShadow(
-                        color: _currentThemeColor
-                            .withOpacity(.3),
-                        blurRadius: 8,
-                      )
-                    ]
-                        : [],
-                  ),
-                  child: isSelected
-                      ? Icon(Icons.check,
-                      size: 22,
-                      color: opt.isDefault
-                          ? const Color(0xFF666666)
-                          : _contrastColor(opt.color))
-                      : null,
-                ),
-                const SizedBox(height: 5),
-                Text(opt.label,
-                    style: TextStyle(
-                        fontSize: 11,
-                        color: isSelected
-                            ? _currentThemeColor
-                            : const Color(0xFF888888),
-                        fontWeight: isSelected
-                            ? FontWeight.w600
-                            : FontWeight.normal)),
-              ]),
-            );
-          }).toList(),
         ),
       ),
 

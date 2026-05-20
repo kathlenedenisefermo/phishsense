@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ─── How It Works steps (Android — real-time) ─────────────────────────────────
@@ -92,11 +93,39 @@ class _ProfilePageState extends State<ProfilePage> {
     '👨‍🚀', '👩‍🚀', '👨‍✈️', '👩‍✈️',
   ];
 
+  static const _kAvatarPathKey  = 'profile_avatar_path';
+  static const _kAvatarEmojiKey = 'profile_avatar_emoji';
+
   @override
   void initState() {
     super.initState();
-    _name = widget.name;
+    _name        = widget.name;
     _spamEnabled = widget.spamFolderEnabled;
+    _loadAvatar();
+  }
+
+  Future<void> _loadAvatar() async {
+    final prefs = await SharedPreferences.getInstance();
+    final path  = prefs.getString(_kAvatarPathKey);
+    final emoji = prefs.getString(_kAvatarEmojiKey);
+    if (!mounted) return;
+    if (path != null && File(path).existsSync()) {
+      setState(() => _imagePath = path);
+    } else if (emoji != null) {
+      setState(() => _avatar = emoji);
+    }
+  }
+
+  Future<void> _saveAvatarPath(String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kAvatarPathKey, path);
+    await prefs.remove(_kAvatarEmojiKey);
+  }
+
+  Future<void> _saveAvatarEmoji(String emoji) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kAvatarEmojiKey, emoji);
+    await prefs.remove(_kAvatarPathKey);
   }
 
   bool get _canEdit =>
@@ -162,8 +191,15 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Future<void> _pickImage(ImageSource src) async {
     Navigator.pop(context);
-    final p = await ImagePicker().pickImage(source: src, imageQuality: 85);
-    if (p != null && mounted) setState(() => _imagePath = p.path);
+    final picked = await ImagePicker().pickImage(source: src, imageQuality: 85);
+    if (picked == null || !mounted) return;
+    // Copy to the app's documents directory so the file survives app restarts
+    // and OS temp-file cleanup.
+    final docsDir  = await getApplicationDocumentsDirectory();
+    final destPath = '${docsDir.path}/profile_avatar.jpg';
+    await File(picked.path).copy(destPath);
+    await _saveAvatarPath(destPath);
+    if (mounted) setState(() { _imagePath = destPath; });
   }
 
   void _showAvatarGrid() {
@@ -180,12 +216,11 @@ class _ProfilePageState extends State<ProfilePage> {
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
             crossAxisCount: 4, mainAxisSpacing: 16, crossAxisSpacing: 16),
         itemBuilder: (_, i) => GestureDetector(
-          onTap: () {
-            setState(() {
-              _avatar = _avatars[i];
-              _imagePath = null;
-            });
+          onTap: () async {
+            final emoji = _avatars[i];
+            setState(() { _avatar = emoji; _imagePath = null; });
             Navigator.pop(ctx);
+            await _saveAvatarEmoji(emoji);
           },
           child: CircleAvatar(
               radius: 30,

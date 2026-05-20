@@ -22,18 +22,22 @@ class ReportTrackerBody extends StatefulWidget {
   final String deviceId;
   final String source;
   final bool spamFolderEnabled;
+  final bool showHeader;
   final void Function(String sender, String messageId)? onOpenConversation;
   final void Function(void Function())? onToggleHideReviewed;
   final void Function(bool)? onHideReviewedChanged;
+  final VoidCallback? onViewedChanged;
 
   const ReportTrackerBody({
     super.key,
     required this.deviceId,
     required this.source,
     this.spamFolderEnabled = false,
+    this.showHeader = false,
     this.onOpenConversation,
     this.onToggleHideReviewed,
     this.onHideReviewedChanged,
+    this.onViewedChanged,
   });
 
   @override
@@ -77,8 +81,11 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
   }
 
   void _subscribeStreams() {
+    _activeSub?.cancel();
+    if (widget.deviceId.isEmpty) return;
     _activeSub = FirebaseFirestore.instance
         .collection('model_feedback')
+        .where('deviceId', isEqualTo: widget.deviceId)
         .snapshots()
         .listen((snap) {
       _activeDocs = snap.docs.where((doc) {
@@ -205,11 +212,59 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
           ...visibleDecided,
         ];
 
+        final headerOffset = widget.showHeader ? 1 : 0;
+        final pendingCount = pendingDocs.length;
+
         return ListView.builder(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
-          itemCount: items.length,
+          itemCount: items.length + headerOffset,
           itemBuilder: (ctx, i) {
-            final item = items[i];
+            if (i == 0 && widget.showHeader) {
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(0, 0, 0, 16),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Report Tracker',
+                        style: TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
+                    Text(
+                      pendingCount == 0
+                          ? 'No reports yet'
+                          : '$pendingCount inaccurate detection report${pendingCount == 1 ? '' : 's'}',
+                      style: const TextStyle(fontSize: 13, color: Color(0xFF888888)),
+                    ),
+                  ]),
+                  const Spacer(),
+                  GestureDetector(
+                    onTap: () {
+                      setState(() => _hideReviewed = !_hideReviewed);
+                      widget.onHideReviewedChanged?.call(_hideReviewed);
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: const Color(0xFF1A7A72), width: 1.5),
+                        borderRadius: BorderRadius.circular(30),
+                      ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(
+                          _hideReviewed ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                          size: 15, color: const Color(0xFF1A7A72),
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          _hideReviewed ? 'Show all' : 'Hide reviewed',
+                          style: const TextStyle(
+                              fontSize: 13,
+                              color: Color(0xFF1A7A72),
+                              fontWeight: FontWeight.w600),
+                        ),
+                      ]),
+                    ),
+                  ),
+                ]),
+              );
+            }
+            final item = items[i - headerOffset];
             if (item is _SectionDivider) return const SizedBox.shrink();
             final report = item as ReportModel;
             final isNew = (report.status == ReportStatus.validated ||
@@ -688,6 +743,7 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
     _viewedReportIds.add(reportId);
     await p.setString(_viewedKey, jsonEncode(_viewedReportIds.toList()));
     if (mounted) setState(() {});
+    widget.onViewedChanged?.call();
     _subscribeStreams();
   }
 
@@ -696,7 +752,7 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
     _viewedReportIds.remove(reportId);
     await p.setString(_viewedKey, jsonEncode(_viewedReportIds.toList()));
     if (mounted) setState(() {});
-    // Trigger badge listener to re-read by forcing a Firestore snapshot refresh
+    widget.onViewedChanged?.call();
     _subscribeStreams();
   }
 }
@@ -931,7 +987,7 @@ class _ReportTrackerCardState extends State<_ReportTrackerCard> {
     final statusColor = isUnderReview
         ? const Color(0xFF888888)
         : isValidated
-        ? const Color(0xFF1A7A72)
+        ? const Color(0xFF2E7D32)
         : const Color(0xFFF2554F);
 
     return GestureDetector(
@@ -1090,7 +1146,7 @@ class _ReportTrackerCardState extends State<_ReportTrackerCard> {
                   if (!movesToSpam && !movesToInbox) return const SizedBox.shrink();
                   final moveColor = movesToSpam
                       ? const Color(0xFFF2554F)
-                      : const Color(0xFF1A7A72);
+                      : const Color(0xFF1565C0);
                   final moveIcon  = movesToSpam
                       ? Icons.move_to_inbox_outlined
                       : Icons.inbox_outlined;

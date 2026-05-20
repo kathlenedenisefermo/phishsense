@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
@@ -13,6 +14,7 @@ import 'report_tracker.dart';
 import 'package:share_plus/share_plus.dart';
 import 'customize_chatroom.dart';
 import 'report_model.dart';
+import 'services/phishing_detector.dart';
 
 const String kSpamWallpaperDefault = '8';
 
@@ -43,9 +45,8 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
   final  _scaffoldKey = GlobalKey<ScaffoldState>();
   StreamSubscription<QuerySnapshot>? _globalReportSub;
   StreamSubscription<QuerySnapshot>? _reportBadgeSub;
+  List<QueryDocumentSnapshot>? _cachedReportDocs;
   int _unviewedReportCount = 0;
-  bool _hideReviewed = false;
-  void Function()? _toggleHideReviewed;
 
   @override
   void initState() {
@@ -86,29 +87,71 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
 
   void _startReportBadgeListener(String deviceId) {
     _reportBadgeSub?.cancel();
+    if (deviceId.isEmpty) return;
     _reportBadgeSub = FirebaseFirestore.instance
         .collection('model_feedback')
+        .where('deviceId', isEqualTo: deviceId)
         .snapshots()
-        .listen((snap) async {
-      final p = await SharedPreferences.getInstance();
-      final raw = p.getString('viewed_report_ids');
-      final viewed = raw != null && raw.isNotEmpty
-          ? (jsonDecode(raw) as List).cast<String>().toSet()
-          : <String>{};
-      const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
-      final count = snap.docs.where((doc) {
-        final data   = doc.data() as Map<String, dynamic>;
-        final status = data['status']?.toString() ?? '';
-        final src    = (data['source'] ?? 'inbox').toString();
-        // Inbox badge: only inbox-sourced reports (or legacy)
-        // When spam is off, also include spam-sourced since they show in inbox tab
-        final isInboxReport = src == 'inbox' || !_spamEnabled;
-        return reviewedStatuses.contains(status)
-            && !viewed.contains(doc.id)
-            && isInboxReport;
-      }).length;
-      if (mounted) setState(() => _unviewedReportCount = count);
+        .listen((snap) {
+      _cachedReportDocs = snap.docs;
+      _refreshInboxBadge();
+      _applyLabelUpdatesFromSnapshot(snap.docs);
     }, onError: (e) => debugPrint('Report badge listener error: $e'));
+  }
+
+  // Applies corrected labels from reviewed Firestore reports directly to the
+  // in-memory thread list so the thread badge (Safe Thread / Phishing Detected)
+  // reflects the latest developer decision without requiring the user to open
+  // and close the conversation page.
+  Future<void> _applyLabelUpdatesFromSnapshot(
+      List<QueryDocumentSnapshot> docs) async {
+    if (_spamEnabled) return; // spam folder handles its own label logic
+    const reviewedStatuses = {'verified', 'validated', 'trained'};
+    bool changed = false;
+    for (final doc in docs) {
+      final data          = doc.data() as Map<String, dynamic>;
+      final status        = data['status']?.toString() ?? '';
+      if (!reviewedStatuses.contains(status)) continue;
+      final msgTime       = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+      final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+      if (msgTime.isEmpty) continue;
+      final finalLabel = originalLabel == 'phishing' ? 'Safe' : 'Phishing';
+      for (final msg in _allMessages) {
+        if (msg['time']?.toString() == msgTime &&
+            (msg['label'] ?? '').toString() != finalLabel) {
+          msg['label'] = finalLabel;
+          changed = true;
+        }
+      }
+    }
+    if (changed && mounted) {
+      setState(() {
+        _threads         = _buildThreads(_allMessages);
+        _filteredThreads = _applySearch(_threads);
+      });
+      await _persistManualScans(_allMessages);
+    }
+  }
+
+  Future<void> _refreshInboxBadge() async {
+    final docs = _cachedReportDocs;
+    if (docs == null) return;
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString('viewed_report_ids');
+    final viewed = raw != null && raw.isNotEmpty
+        ? (jsonDecode(raw) as List).cast<String>().toSet()
+        : <String>{};
+    const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
+    final count = docs.where((doc) {
+      final data   = doc.data() as Map<String, dynamic>;
+      final status = data['status']?.toString() ?? '';
+      final src    = (data['source'] ?? 'inbox').toString();
+      final isInboxReport = src == 'inbox' || !_spamEnabled;
+      return reviewedStatuses.contains(status)
+          && !viewed.contains(doc.id)
+          && isInboxReport;
+    }).length;
+    if (mounted) setState(() => _unviewedReportCount = count);
   }
 
   void _startGlobalReportListener(String deviceId) {
@@ -172,7 +215,6 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
     if (mounted) {
       setState(() => _spamEnabled = v);
       if (_scaffoldKey.currentState?.isEndDrawerOpen == true) Navigator.of(context).pop();
-      _showCenterNotice(v ? 'Spam Folder enabled.' : 'Spam Folder disabled.');
       await _loadMessages();
     }
   }
@@ -349,10 +391,47 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
     return confirmed;
   }
 
+  /// Strips non-digit characters and normalises a Philippine mobile number to
+  /// the `09XXXXXXXXX` (11-digit) form.  Returns null if [s] is not a PH number.
+  static String? _normalizePHNumber(String s) {
+    final d = s.replaceAll(RegExp(r'\D'), '');
+    if (d.startsWith('639') && d.length == 12) return '0${d.substring(2)}';
+    if (d.startsWith('9')   && d.length == 10) return '0$d';
+    if (d.startsWith('0')   && d.length == 11) return d;
+    return null;
+  }
+
+  /// Returns the canonical sender already stored in [_allMessages] that is
+  /// equivalent to [entered], or [entered] itself if no match is found.
+  /// Equivalence rules:
+  ///   • PH phone numbers: normalised to `09XXXXXXXXX` before comparing.
+  ///   • Names: case-insensitive.
+  String _canonicalSender(String entered) {
+    if (entered.isEmpty) return entered;
+    final enteredPhone = _normalizePHNumber(entered);
+    final enteredLower = entered.toLowerCase();
+    for (final msg in _allMessages) {
+      final existing = (msg['sender'] ?? '').toString();
+      if (existing.isEmpty) continue;
+      final existingPhone = _normalizePHNumber(existing);
+      if (enteredPhone != null && existingPhone != null &&
+          enteredPhone == existingPhone) return existing;
+      if (enteredPhone == null && existingPhone == null &&
+          existing.toLowerCase() == enteredLower) return existing;
+    }
+    return entered;
+  }
+
   void _openScanSheet() {
     showModalBottomSheet(
       context: context, isScrollControlled: true, backgroundColor: Colors.transparent,
       builder: (_) => _ScanBottomSheet(onResult: (result) async {
+        // Resolve to the canonical sender already in the inbox (handles
+        // case differences and PH number format variants).
+        final rawSender = (result['sender'] ?? '').toString();
+        final canonical = _canonicalSender(rawSender);
+        result['sender'] = canonical;
+
         final isPhishing = (result['label'] as String).toLowerCase() == 'phishing';
         if (isPhishing && _spamEnabled) {
           await saveSpamMessage(result);
@@ -504,6 +583,15 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
               if (mounted) Navigator.pop(context);
             }
           },
+          onDeleteMessages: (times) async {
+            final updated = _allMessages.where((m) => !times.contains(m['time']?.toString())).toList();
+            if (mounted) setState(() {
+              _allMessages     = updated;
+              _threads         = _buildThreads(updated);
+              _filteredThreads = _applySearch(_threads);
+            });
+            await _persistManualScans(updated);
+          },
         ),
       ),
     ).then((_) => _loadMessages());
@@ -522,70 +610,25 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
       body: SafeArea(bottom: false, child: Column(children: [
         Container(color: const Color(0xFF1A7A72), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
             child: Row(children: [Image.asset('assets/images/phishsense_logo.png', height: 56, fit: BoxFit.contain)])),
+        if (_activeTab == 0)
         Padding(
           padding: const EdgeInsets.fromLTRB(22, 12, 8, 0),
           child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-            if (_activeTab == 1) Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('Report Tracker', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
-              StreamBuilder<QuerySnapshot>(
-                stream: FirebaseFirestore.instance
-                    .collection('model_feedback')
-                    .snapshots(),
-                builder: (context, snap) {
-                  final count = snap.data?.docs.where((doc) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    final status = data['status']?.toString() ?? '';
-                    return status == 'under_review' || status == 'pending';
-                  }).length ?? 0;
-                  return Text(
-                    count == 0 ? 'No reports yet' : '$count inaccurate detection report${count == 1 ? '' : 's'}',
-                    style: const TextStyle(fontSize: 13, color: Color(0xFF888888)),
-                  );
-                },
-              ),
-            ]),
-            if (_activeTab == 0) Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('Messages', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Messaging', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
               if (!_loading) Text(
                   threadCount == 0 ? 'No conversations' : '$threadCount conversation${threadCount == 1 ? '' : 's'}',
                   style: const TextStyle(fontSize: 13, color: Color(0xFF888888))),
             ]),
             const Spacer(),
-            if (_activeTab == 1)
-              GestureDetector(
-                onTap: () => _toggleHideReviewed?.call(),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF1A7A72), width: 1.5),
-                    borderRadius: BorderRadius.circular(30),
-                  ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(
-                      _hideReviewed ? Icons.visibility_outlined : Icons.visibility_off_outlined,
-                      size: 15, color: const Color(0xFF1A7A72),
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      _hideReviewed ? 'Show all' : 'Hide reviewed',
-                      style: const TextStyle(
-                          fontSize: 13,
-                          color: Color(0xFF1A7A72),
-                          fontWeight: FontWeight.w600),
-                    ),
-                  ]),
-                ),
-              ),
-            if (_activeTab == 0)
-              IconButton(
-                  tooltip: _spamEnabled ? 'Spam Folder' : 'Spam Folder (disabled)',
-                  icon: Icon(Icons.folder, color: _spamEnabled ? const Color(0xFF1A7A72) : const Color(0xFFBBBBBB)),
-                  onPressed: _openSpamFolder),
-            if (_activeTab == 0)
-              IconButton(
-                  tooltip: 'Profile',
-                  icon: const Icon(Icons.person, color: Color(0xFF1A7A72)),
-                  onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
+            IconButton(
+                tooltip: _spamEnabled ? 'Spam Folder' : 'Spam Folder (disabled)',
+                icon: Icon(Icons.folder, color: _spamEnabled ? const Color(0xFF1A7A72) : const Color(0xFFBBBBBB)),
+                onPressed: _openSpamFolder),
+            IconButton(
+                tooltip: 'Profile',
+                icon: const Icon(Icons.person, color: Color(0xFF1A7A72)),
+                onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
           ]),
         ),
         const SizedBox(height: 10),
@@ -667,6 +710,26 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
                   return false;
                 },
                 child: InkWell(
+                  onLongPress: () {
+                    showModalBottomSheet(
+                      context: context,
+                      backgroundColor: Colors.transparent,
+                      builder: (_) => _OptionsSheet(children: [
+                        _SheetAction(
+                          icon: Icons.delete_outline,
+                          iconColor: const Color(0xFFF2554F),
+                          label: 'Delete Conversation',
+                          labelColor: const Color(0xFFF2554F),
+                          onTap: () async {
+                            Navigator.pop(context);
+                            if (await _confirmDeleteThread(sender)) {
+                              await _deleteThread(sender);
+                            }
+                          },
+                        ),
+                      ]),
+                    );
+                  },
                   onTap: () => Navigator.push(context, MaterialPageRoute(
                       builder: (_) => _ConversationPage(
                           messages: thread['messages'] as List<Map<String, dynamic>>,
@@ -676,7 +739,17 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
                               await _deleteThread(sender);
                               if (mounted) Navigator.pop(context);
                             }
-                          }))),
+                          },
+                          onDeleteMessages: (times) async {
+                            final updated = _allMessages.where((m) => !times.contains(m['time']?.toString())).toList();
+                            if (mounted) setState(() {
+                              _allMessages     = updated;
+                              _threads         = _buildThreads(updated);
+                              _filteredThreads = _applySearch(_threads);
+                            });
+                            await _persistManualScans(updated);
+                          },
+                          ))).then((_) => _loadMessages()),
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -748,9 +821,10 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
           deviceId: _deviceId,
           source: 'inbox',
           spamFolderEnabled: _spamEnabled,
+          showHeader: true,
           onOpenConversation: _openConversationFromReport,
-          onToggleHideReviewed: (fn) => _toggleHideReviewed = fn,
-          onHideReviewedChanged: (val) => setState(() => _hideReviewed = val),
+          onHideReviewedChanged: (_) {},
+          onViewedChanged: _refreshInboxBadge,
         ),
       ),
     );
@@ -933,6 +1007,7 @@ class _ConversationPage extends StatefulWidget {
   final String sender;
   final String Function(String?) formatTime;
   final VoidCallback onDeleteThread;
+  final Future<void> Function(List<String> times) onDeleteMessages;
   final String deviceId;
   final String? highlightMessageTime; // <── new: scroll to this message
 
@@ -943,6 +1018,7 @@ class _ConversationPage extends StatefulWidget {
     required this.sender,
     required this.formatTime,
     required this.onDeleteThread,
+    required this.onDeleteMessages,
     required this.deviceId,
     this.highlightMessageTime,
     this.spamFolderEnabled = false,
@@ -981,10 +1057,13 @@ class _ConversationPageState extends State<_ConversationPage> {
   int     _phishingNavIdx       = 0;
   String? _phishingHighlightTime;
 
+  late List<Map<String, dynamic>> _localMessages;
+
   @override
   void initState() {
     super.initState();
-    _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
+    _localMessages = List.from(widget.messages);
+    _itemKeys = List.generate(_localMessages.length, (_) => GlobalKey());
     _reportHighlightTime = widget.highlightMessageTime;
     _loadChatroomPrefs();
     _loadStatus().then((_) => _startRealtimeListener());
@@ -1006,7 +1085,7 @@ class _ConversationPageState extends State<_ConversationPage> {
 
   void _scrollToHighlightedMessage() {
     // Find index of the highlighted message in the reversed list
-    final reversedMsgs = widget.messages.reversed.toList();
+    final reversedMsgs = _localMessages.reversed.toList();
     final revIdx = reversedMsgs.indexWhere(
             (m) => m['time']?.toString() == widget.highlightMessageTime);
     if (revIdx == -1) {
@@ -1016,7 +1095,7 @@ class _ConversationPageState extends State<_ConversationPage> {
       return;
     }
     // origIdx in original list
-    final origIdx = widget.messages.length - 1 - revIdx;
+    final origIdx = _localMessages.length - 1 - revIdx;
     final ctx = _itemKeys[origIdx].currentContext;
     if (ctx != null) {
       Scrollable.ensureVisible(
@@ -1091,8 +1170,20 @@ class _ConversationPageState extends State<_ConversationPage> {
   }
 
   Future<void> _loadChatroomPrefs() async {
-    // Spam conversations always use the '8' wallpaper (no customization).
-    if (mounted) setState(() => _wallpaperKey = widget.spamFolderEnabled ? kSpamWallpaperDefault : 'background');
+    if (widget.spamFolderEnabled) {
+      if (mounted) setState(() => _wallpaperKey = kSpamWallpaperDefault);
+      return;
+    }
+    final prefs = await loadChatroomPrefs(widget.sender);
+    if (!mounted) return;
+    Color color = const Color(0xFF1A7A72);
+    for (final t in kThemes) {
+      if (t.key == prefs.theme) { color = t.color; break; }
+    }
+    setState(() {
+      _themeColor   = color;
+      _wallpaperKey = prefs.wallpaper;
+    });
   }
 
   Color _wallpaperColorFromKey(String key) {
@@ -1131,14 +1222,26 @@ class _ConversationPageState extends State<_ConversationPage> {
           .where('sender', isEqualTo: widget.sender)
           .get();
       bool changed = false;
+      const reviewedStatuses = {'verified', 'validated', 'trained', 'rejected'};
       for (final doc in snap.docs) {
-        final data    = doc.data();
-        final msgTime = (data['messageId'] ?? data['messageTime'] ?? '').toString();
-        final status  = data['status']?.toString() ?? 'under_review';
-        final prevStatus = _reportStatus[msgTime];
-        if (msgTime.isNotEmpty && prevStatus != status) {
-          _reportStatus[msgTime] = status;
-          changed = true;
+        final data          = doc.data() as Map<String, dynamic>;
+        final msgTime       = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+        final status        = data['status']?.toString() ?? 'under_review';
+        final originalLabel = (data['originalLabel'] ?? '').toString().toLowerCase();
+        final prevStatus    = _reportStatus[msgTime];
+        if (msgTime.isNotEmpty) {
+          if (prevStatus != status) {
+            _reportStatus[msgTime] = status;
+            changed = true;
+          }
+          // If already reviewed but _correctedLabel not yet applied (e.g. app was
+          // closed before the decision arrived, or report was validated via spam
+          // folder page which never writes _correctedLabel), apply it now so the
+          // bubble reflects the correct colour instead of the stale original label.
+          if (reviewedStatuses.contains(status) && !_correctedLabel.containsKey(msgTime)) {
+            await _applyReviewDecision(msgTime, status, originalLabel);
+            changed = true;
+          }
         }
       }
       if (changed && mounted) {
@@ -1218,24 +1321,24 @@ class _ConversationPageState extends State<_ConversationPage> {
   }
 
   String? _statusFor(int i) {
-    final time = widget.messages[i]['time']?.toString() ?? '';
+    final time = _localMessages[i]['time']?.toString() ?? '';
     return _reportStatus[time];
   }
 
   String _labelFor(int i) {
-    final time = widget.messages[i]['time']?.toString() ?? '';
-    return _correctedLabel[time] ?? (widget.messages[i]['label'] ?? '').toString();
+    final time = _localMessages[i]['time']?.toString() ?? '';
+    return _correctedLabel[time] ?? (_localMessages[i]['label'] ?? '').toString();
   }
 
   List<int> get _matchIndices {
     if (_query.isEmpty) return [];
-    return List.generate(widget.messages.length, (i) => i)
-        .where((i) => (widget.messages[i]['message'] ?? '').toString().toLowerCase().contains(_query.toLowerCase()))
+    return List.generate(_localMessages.length, (i) => i)
+        .where((i) => (_localMessages[i]['message'] ?? '').toString().toLowerCase().contains(_query.toLowerCase()))
         .toList();
   }
 
   List<int> get _phishingIndices =>
-      List.generate(widget.messages.length, (i) => i)
+      List.generate(_localMessages.length, (i) => i)
           .where((i) => _labelFor(i).toLowerCase() == 'phishing')
           .toList();
 
@@ -1243,7 +1346,7 @@ class _ConversationPageState extends State<_ConversationPage> {
     final indices = _phishingIndices;
     if (indices.isEmpty) return;
     final origIdx   = indices[idx.clamp(0, indices.length - 1)];
-    final msgTime   = widget.messages[origIdx]['time']?.toString();
+    final msgTime   = _localMessages[origIdx]['time']?.toString();
     if (mounted) setState(() => _phishingHighlightTime = msgTime);
     final ctx = _itemKeys[origIdx].currentContext;
     if (ctx != null) Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 300), curve: Curves.easeInOut, alignment: 0.1);
@@ -1505,7 +1608,7 @@ class _ConversationPageState extends State<_ConversationPage> {
                         });
                       } else {
                         // Message stayed here — just scroll and highlight
-                        setState(() => _reportHighlightTime = widget.messages
+                        setState(() => _reportHighlightTime = _localMessages
                             .firstWhere(
                               (m) => (m['message'] ?? '').toString().trim() ==
                               report.message.trim(),
@@ -1588,7 +1691,7 @@ class _ConversationPageState extends State<_ConversationPage> {
   // ── Redesigned Confirm Report / Report sheet ──────────────────────────────
 
   void _showReportSheet(BuildContext ctx, int index) {
-    final msg        = widget.messages[index];
+    final msg        = _localMessages[index];
     final isPhishing = _labelFor(index).toLowerCase() == 'phishing';
     final reasons  = isPhishing
         ? ['This is from a trusted sender', 'This is a legitimate promotional message',
@@ -1699,10 +1802,21 @@ class _ConversationPageState extends State<_ConversationPage> {
                       child: const Text('Cancel',
                           style: TextStyle(color: Color(0xFF888888), fontSize: 15)),
                     ),
-                    TextButton(
-                      style: TextButton.styleFrom(
-                        foregroundColor: const Color(0xFFF2554F),
-                        disabledForegroundColor: const Color(0xFFBBBBBB),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: (selected == null ||
+                            (selected == 'Other reason' &&
+                                otherCtrl.text.trim().isEmpty))
+                            ? const Color(0xFFDDDDDD)
+                            : const Color(0xFFF2554F),
+                        foregroundColor: (selected == null ||
+                            (selected == 'Other reason' &&
+                                otherCtrl.text.trim().isEmpty))
+                            ? const Color(0xFF999999)
+                            : Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10)),
                       ),
                       onPressed: (selected == null ||
                           (selected == 'Other reason' &&
@@ -1848,7 +1962,7 @@ class _ConversationPageState extends State<_ConversationPage> {
   // ── Message Details dialog ────────────────────────────────────────────────
 
   void _showMessageDetails(BuildContext ctx, int index) {
-    final msg            = widget.messages[index];
+    final msg            = _localMessages[index];
     final message        = (msg['message'] ?? '').toString();
     final sender         = (msg['sender'] ?? widget.sender).toString();
     final timeRaw        = msg['time']?.toString() ?? '';
@@ -2057,7 +2171,7 @@ class _ConversationPageState extends State<_ConversationPage> {
   // ── Long-press bottom sheet ───────────────────────────────────────────────
 
   void _showMessageOptions(BuildContext ctx, int index) {
-    final msg      = widget.messages[index];
+    final msg      = _localMessages[index];
     final message  = (msg['message'] ?? '').toString();
     final isStarred = _starredIndices.contains(index);
 
@@ -2107,7 +2221,7 @@ class _ConversationPageState extends State<_ConversationPage> {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
             child: Builder(builder: (context) {
-              final msgTime = widget.messages[index]['time']?.toString() ?? '';
+              final msgTime = _localMessages[index]['time']?.toString() ?? '';
               final status = _reportStatus[msgTime];
               final isUnderReview = status == 'pending' || status == 'under_review';
               return OutlinedButton.icon(
@@ -2145,9 +2259,8 @@ class _ConversationPageState extends State<_ConversationPage> {
               }),
               _bottomAction(Icons.delete_outline, 'Delete', () async {
                 Navigator.pop(ctx);
-                bool confirmed = false;
-                await showDialog(
-                  context: ctx,
+                final confirmed = await showDialog<bool>(
+                  context: context,
                   builder: (dctx) => AlertDialog(
                     backgroundColor: const Color(0xFFF6F4EC),
                     shape: RoundedRectangleBorder(
@@ -2163,18 +2276,12 @@ class _ConversationPageState extends State<_ConversationPage> {
                     const EdgeInsets.fromLTRB(12, 0, 12, 12),
                     actions: [
                       TextButton(
-                          onPressed: () {
-                            confirmed = false;
-                            Navigator.pop(dctx);
-                          },
+                          onPressed: () => Navigator.pop(dctx, false),
                           child: const Text('Cancel',
                               style:
                               TextStyle(color: Color(0xFF1A7A72)))),
                       ElevatedButton(
-                          onPressed: () {
-                            confirmed = true;
-                            Navigator.pop(dctx);
-                          },
+                          onPressed: () => Navigator.pop(dctx, true),
                           style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFFF2554F),
                               foregroundColor: Colors.white,
@@ -2185,6 +2292,12 @@ class _ConversationPageState extends State<_ConversationPage> {
                     ],
                   ),
                 );
+                if (confirmed == true && mounted) {
+                  final time = _localMessages[index]['time']?.toString() ?? '';
+                  setState(() => _localMessages.removeWhere(
+                      (m) => m['time']?.toString() == time));
+                  await widget.onDeleteMessages([time]);
+                }
               }, color: const Color(0xFFF2554F)),
             ]),
           ),
@@ -2323,16 +2436,15 @@ class _ConversationPageState extends State<_ConversationPage> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF888888).withOpacity(.1),
+                  color: const Color(0xFF555555),
                   borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFF888888).withOpacity(.3)),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                  Icon(Icons.hourglass_top_rounded, size: 12, color: Color(0xFF888888)),
+                  Icon(Icons.hourglass_top_rounded, size: 12, color: Colors.white),
                   SizedBox(width: 5),
                   Text('Verification in Progress',
                       style: TextStyle(
-                          fontSize: 11, color: Color(0xFF888888), fontWeight: FontWeight.w600)),
+                          fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600)),
                 ]),
               )
             else
@@ -2480,7 +2592,7 @@ class _ConversationPageState extends State<_ConversationPage> {
             icon: const Icon(Icons.select_all),
             onPressed: () => setState(() {
               _selectedIndices.addAll(
-                  List.generate(widget.messages.length, (i) => i));
+                  List.generate(_localMessages.length, (i) => i));
             }),
           ),
           // Delete selected
@@ -2534,10 +2646,17 @@ class _ConversationPageState extends State<_ConversationPage> {
                 ),
               );
               if (confirmed) {
-                setState(() {
+                final times = _selectedIndices
+                    .map((i) => _localMessages[i]['time']?.toString() ?? '')
+                    .where((t) => t.isNotEmpty)
+                    .toList();
+                if (mounted) setState(() {
+                  _localMessages.removeWhere(
+                      (m) => times.contains(m['time']?.toString()));
                   _selectMode = false;
                   _selectedIndices.clear();
                 });
+                await widget.onDeleteMessages(times);
               }
             },
           ),
@@ -2561,7 +2680,7 @@ class _ConversationPageState extends State<_ConversationPage> {
             ? PreferredSize(
                 preferredSize: const Size.fromHeight(58),
                 child: Container(
-                  color: const Color(0xFF1A7A72),
+                  color: _themeColor,
                   padding: const EdgeInsets.fromLTRB(12, 0, 8, 10),
                   child: Row(
                     children: [
@@ -2627,7 +2746,7 @@ class _ConversationPageState extends State<_ConversationPage> {
             : null,
       ),
       body: Builder(builder: (ctx2) {
-        final msgs = widget.messages.reversed.toList();
+        final msgs = _localMessages.reversed.toList();
         final phishingIndices = _phishingIndices;
         final phishingCount   = phishingIndices.length;
         return Stack(children: [
@@ -2694,16 +2813,18 @@ class _ConversationPageState extends State<_ConversationPage> {
             Expanded(child: Stack(
               children: [
                 Positioned.fill(
-                  child: kWallpaperImages.contains(_wallpaperKey)
-                      ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
-                      : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
+                  child: _wallpaperKey.startsWith('gallery_file:')
+                      ? Image.file(File(_wallpaperKey.substring('gallery_file:'.length)), fit: BoxFit.cover)
+                      : kWallpaperImages.contains(_wallpaperKey)
+                          ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
+                          : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
                 ),
                 ListView.builder(
                   controller: _scrollCtrl,
               padding: const EdgeInsets.only(top: 16, bottom: 32),
               itemCount: msgs.length,
               itemBuilder: (_, i) {
-            final origIdx         = widget.messages.length - 1 - i;
+            final origIdx         = _localMessages.length - 1 - i;
             final msg             = msgs[i];
             final msgTime         = msg['time']?.toString() ?? '';
             final status          = _statusFor(origIdx);
@@ -3001,6 +3122,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
   int _spamReportCount = 0;
   StreamSubscription<QuerySnapshot>? _spamReportBadgeSub;
+  List<QueryDocumentSnapshot>? _cachedSpamReportDocs;
 
   bool _selectMode = false;
   String _query = '';
@@ -3068,26 +3190,35 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
   void _startSpamReportBadgeListener() {
     _spamReportBadgeSub?.cancel();
+    if (widget.deviceId.isEmpty) return;
     _spamReportBadgeSub = FirebaseFirestore.instance
         .collection('model_feedback')
+        .where('deviceId', isEqualTo: widget.deviceId)
         .snapshots()
-        .listen((snap) async {
-      final p = await SharedPreferences.getInstance();
-      final raw = p.getString('viewed_report_ids');
-      final viewed = raw != null && raw.isNotEmpty
-          ? (jsonDecode(raw) as List).cast<String>().toSet()
-          : <String>{};
-      const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
-      final count = snap.docs.where((doc) {
-        final data   = doc.data() as Map<String, dynamic>;
-        final status = data['status']?.toString() ?? '';
-        final src    = (data['source'] ?? 'inbox').toString();
-        return reviewedStatuses.contains(status)
-            && src == 'spam'
-            && !viewed.contains(doc.id);
-      }).length;
-      if (mounted) setState(() => _spamReportCount = count);
+        .listen((snap) {
+      _cachedSpamReportDocs = snap.docs;
+      _refreshSpamBadge();
     }, onError: (e) => debugPrint('Spam report badge error: $e'));
+  }
+
+  Future<void> _refreshSpamBadge() async {
+    final docs = _cachedSpamReportDocs;
+    if (docs == null) return;
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString('viewed_report_ids');
+    final viewed = raw != null && raw.isNotEmpty
+        ? (jsonDecode(raw) as List).cast<String>().toSet()
+        : <String>{};
+    const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
+    final count = docs.where((doc) {
+      final data   = doc.data() as Map<String, dynamic>;
+      final status = data['status']?.toString() ?? '';
+      final src    = (data['source'] ?? 'inbox').toString();
+      return reviewedStatuses.contains(status)
+          && src == 'spam'
+          && !viewed.contains(doc.id);
+    }).length;
+    if (mounted) setState(() => _spamReportCount = count);
   }
 
   void _startReviewListener() {
@@ -3223,13 +3354,16 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
   Future<void> _loadSpam() async {
     final p   = await SharedPreferences.getInstance();
     final raw = p.getString(_spamKey);
-    var msgs  = raw != null && raw.isNotEmpty
+    final msgs = raw != null && raw.isNotEmpty
         ? (jsonDecode(raw) as List).cast<Map<String, dynamic>>()
         : <Map<String, dynamic>>[];
-    msgs = _applyAutoDeletion(msgs);
+    final filtered = _applyAutoDeletion(msgs);
+    if (filtered.length < msgs.length) {
+      await p.setString(_spamKey, jsonEncode(filtered));
+    }
     if (mounted) setState(() {
-      _spamMessages = msgs;
-      _threads      = _buildThreads(msgs);
+      _spamMessages = filtered;
+      _threads      = _buildThreads(filtered);
       _loading      = false;
     });
   }
@@ -3286,6 +3420,15 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
   Future<void> _deleteFromSpam(String sender) async {
     final updated = _spamMessages.where((m) => (m['sender'] ?? '') != sender).toList();
+    await _persistSpam(updated);
+    setState(() {
+      _spamMessages = updated;
+      _threads      = _buildThreads(updated);
+    });
+  }
+
+  Future<void> _deleteMessageFromSpam(String time) async {
+    final updated = _spamMessages.where((m) => m['time']?.toString() != time).toList();
     await _persistSpam(updated);
     setState(() {
       _spamMessages = updated;
@@ -3902,6 +4045,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                     onRestore: _restoreToInbox,
                     onDelete: _deleteFromSpam,
                     onConfirmDelete: _confirmDelete,
+                    onDeleteMessage: _deleteMessageFromSpam,
                     onReport: (sender, onReported) =>
                         _showReportSheet(context, sender, onReported),
                   ),
@@ -3926,35 +4070,12 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                 ? const Center(child: CircularProgressIndicator(color: Color(0xFF1A7A72)))
                 : Column(children: [
               if (_spamMessages.isNotEmpty) ...[
-                Container(
-                  width: double.infinity,
-                  color: const Color(0xFFF6F4EC),
+                Padding(
                   padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-                  child: Row(children: [
-                    Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                            color: const Color(0xFFF2554F).withOpacity(.12),
-                            borderRadius: BorderRadius.circular(20)),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.warning_rounded, size: 13, color: Color(0xFFF2554F)),
-                          const SizedBox(width: 5),
-                          Text('$phishingCount phishing message${phishingCount != 1 ? 's' : ''}',
-                              style: const TextStyle(fontSize: 12, color: Color(0xFFF2554F), fontWeight: FontWeight.w600)),
-                        ])),
-                    const SizedBox(width: 8),
-                    Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                            color: const Color(0xFF1A7A72).withOpacity(.10),
-                            borderRadius: BorderRadius.circular(20)),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.person, size: 13, color: Color(0xFF1A7A72)),
-                          const SizedBox(width: 5),
-                          Text('$senderCount sender${senderCount != 1 ? 's' : ''}',
-                              style: const TextStyle(fontSize: 12, color: Color(0xFF1A7A72), fontWeight: FontWeight.w600)),
-                        ])),
-                  ]),
+                  child: Text(
+                    '$phishingCount phishing message${phishingCount != 1 ? 's' : ''} from $senderCount sender${senderCount != 1 ? 's' : ''}',
+                    style: const TextStyle(fontSize: 13, color: Color(0xFF888888)),
+                  ),
                 ),
                 const Divider(height: 1, color: Color(0xFFDDD8CE)),
               ],
@@ -4004,9 +4125,8 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                       final latest = thread['latest'] as Map<String, dynamic>;
                       final count  = thread['count'] as int;
                       final time   = widget.formatTime(latest['time'] as String?);
-                      return GestureDetector(
-                        onLongPress: () => _showSpamOptions(ctx, sender),
-                        child: InkWell(
+                      return InkWell(
+                          onLongPress: () => _showSpamOptions(ctx, sender),
                           onTap: () => Navigator.push(
                               context,
                               MaterialPageRoute(
@@ -4017,6 +4137,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                     onRestore: () => _restoreToInbox(sender),
                                     onDelete: () => _deleteFromSpam(sender),
                                     onConfirmDelete: () => _confirmDelete(sender),
+                                    onDeleteMessage: _deleteMessageFromSpam,
                                     onReport: (onReported) =>
                                         _showReportSheet(context, sender, onReported),
                                     deviceId: widget.deviceId,
@@ -4086,7 +4207,6 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                               ),
                             ]),
                           ),
-                        ),
                       );
                     }),
               ),
@@ -4178,6 +4298,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
             },
             onToggleHideReviewed: null,
             onHideReviewedChanged: null,
+            onViewedChanged: _refreshSpamBadge,
           ),
         ),
       ),
@@ -4278,6 +4399,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
   final Future<void> Function(String) onRestore;
   final Future<void> Function(String) onDelete;
   final Future<bool> Function(String) onConfirmDelete;
+  final Future<void> Function(String) onDeleteMessage;
   final void Function(String sender, VoidCallback onReported) onReport;
 
   _SpamSearchDelegate({
@@ -4287,6 +4409,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
     required this.onRestore,
     required this.onDelete,
     required this.onConfirmDelete,
+    required this.onDeleteMessage,
     required this.onReport,
   });
 
@@ -4375,6 +4498,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
                   onRestore: () => onRestore(sender),
                   onDelete: () => onDelete(sender),
                   onConfirmDelete: () => onConfirmDelete(sender),
+                  onDeleteMessage: onDeleteMessage,
                   onReport: (onReported) => onReport(sender, onReported),
                   deviceId: deviceId,
                   spamEnabled: true,
@@ -4399,6 +4523,7 @@ class _SpamConversationPage extends StatefulWidget {
   final VoidCallback onRestore;
   final VoidCallback onDelete;
   final Future<bool> Function() onConfirmDelete;
+  final Future<void> Function(String time) onDeleteMessage;
   final void Function(VoidCallback onReported) onReport;
   final String deviceId;
   final bool spamEnabled;
@@ -4409,6 +4534,7 @@ class _SpamConversationPage extends StatefulWidget {
     required this.onRestore,
     required this.onDelete,
     required this.onConfirmDelete,
+    required this.onDeleteMessage,
     required this.onReport,
     required this.deviceId,
     required this.spamEnabled,
@@ -4436,10 +4562,13 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
       'spam_dismissed_notes_${widget.sender.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_')}';
   StreamSubscription<QuerySnapshot>? _firestoreSub;
 
+  late List<Map<String, dynamic>> _localMessages;
+
   @override
   void initState() {
     super.initState();
-    _itemKeys = List.generate(widget.messages.length, (_) => GlobalKey());
+    _localMessages = List.from(widget.messages);
+    _itemKeys = List.generate(_localMessages.length, (_) => GlobalKey());
     _loadChatroomPrefs();
     _loadAndSyncStatus().then((_) => _startRealtimeListener());
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4661,14 +4790,14 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   }
 
   String? _statusFor(int i) {
-    final time = widget.messages[i]['time']?.toString() ?? '';
+    final time = _localMessages[i]['time']?.toString() ?? '';
     return _reportStatus[time];
   }
 
   List<int> get _matchIndices {
     if (_query.isEmpty) return [];
-    return List.generate(widget.messages.length, (i) => i)
-        .where((i) => (widget.messages[i]['message'] ?? '').toString().toLowerCase().contains(_query.toLowerCase()))
+    return List.generate(_localMessages.length, (i) => i)
+        .where((i) => (_localMessages[i]['message'] ?? '').toString().toLowerCase().contains(_query.toLowerCase()))
         .toList();
   }
 
@@ -4715,7 +4844,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   }
 
   void _showMessageOptions(BuildContext ctx, int origIdx) {
-    final msg = widget.messages[origIdx];
+    final msg = _localMessages[origIdx];
     final message = (msg['message'] ?? '').toString();
     final msgTime = msg['time']?.toString() ?? '';
     final status = _reportStatus[msgTime];
@@ -4787,10 +4916,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                 Navigator.pop(ctx);
                 widget.onReport(() {
                   setState(() {
-                    for (final m in widget.messages) {
-                      final t = m['time']?.toString() ?? '';
-                      if (t.isNotEmpty) _reportStatus[t] = 'pending';
-                    }
+                    if (msgTime.isNotEmpty) _reportStatus[msgTime] = 'pending';
                   });
                 });
               },
@@ -4836,9 +4962,37 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
               }),
               _bottomAction(Icons.delete_outline, 'Delete', () async {
                 Navigator.pop(ctx);
-                if (await widget.onConfirmDelete()) {
-                  widget.onDelete();
-                  if (mounted) Navigator.pop(context);
+                final confirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (dctx) => AlertDialog(
+                    backgroundColor: const Color(0xFFF6F4EC),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+                    title: const Text('Delete Message',
+                        style: TextStyle(fontWeight: FontWeight.w600, fontSize: 17)),
+                    content: const Text('Are you sure you want to delete this message?',
+                        style: TextStyle(fontSize: 14, color: Color(0xFF555555))),
+                    actionsPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(dctx, false),
+                          child: const Text('Cancel',
+                              style: TextStyle(color: Color(0xFF1A7A72)))),
+                      ElevatedButton(
+                          onPressed: () => Navigator.pop(dctx, true),
+                          style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFF2554F),
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10))),
+                          child: const Text('Delete')),
+                    ],
+                  ),
+                );
+                if (confirmed == true && mounted) {
+                  final time = _localMessages[origIdx]['time']?.toString() ?? '';
+                  setState(() => _localMessages.removeWhere(
+                      (m) => m['time']?.toString() == time));
+                  await widget.onDeleteMessage(time);
                 }
               }, color: const Color(0xFFF2554F)),
             ]),
@@ -4881,7 +5035,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
   }
 
   void _showMessageDetails(BuildContext ctx, int index) {
-    final msg = widget.messages[index];
+    final msg = _localMessages[index];
     final message = (msg['message'] ?? '').toString();
     final sender = widget.sender;
     final timeRaw = msg['time']?.toString() ?? '';
@@ -5397,15 +5551,14 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF888888).withOpacity(.1),
+                  color: const Color(0xFF555555),
                   borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFF888888).withOpacity(.3)),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                  Icon(Icons.hourglass_top_rounded, size: 12, color: Color(0xFF888888)),
+                  Icon(Icons.hourglass_top_rounded, size: 12, color: Colors.white),
                   SizedBox(width: 5),
                   Text('Verification in Progress',
-                      style: TextStyle(fontSize: 11, color: Color(0xFF888888), fontWeight: FontWeight.w600)),
+                      style: TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600)),
                 ]),
               )
             else
@@ -5513,7 +5666,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             ? PreferredSize(
                 preferredSize: const Size.fromHeight(58),
                 child: Container(
-                  color: const Color(0xFF1A7A72),
+                  color: _themeColor,
                   padding: const EdgeInsets.fromLTRB(12, 0, 8, 10),
                   child: Row(
                     children: [
@@ -5521,7 +5674,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                         child: Container(
                           height: 42,
                           decoration: BoxDecoration(
-                            color: const Color(0xFF155F59),
+                            color: _themeColor.withOpacity(0.7),
                             borderRadius: BorderRadius.circular(24),
                           ),
                           child: TextField(
@@ -5579,19 +5732,21 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             : null,
       ),
         body: Builder(builder: (_) {
-          final msgs = widget.messages.reversed.toList();
+          final msgs = _localMessages.reversed.toList();
           return Stack(children: [
             Positioned.fill(
-              child: kWallpaperImages.contains(_wallpaperKey)
-                  ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
-                  : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
+              child: _wallpaperKey.startsWith('gallery_file:')
+                  ? Image.file(File(_wallpaperKey.substring('gallery_file:'.length)), fit: BoxFit.cover)
+                  : kWallpaperImages.contains(_wallpaperKey)
+                      ? Image.asset('assets/images/$_wallpaperKey.png', fit: BoxFit.cover)
+                      : ColoredBox(color: _wallpaperColorFromKey(_wallpaperKey)),
             ),
             ListView.builder(
             controller: _scrollCtrl,
           padding: const EdgeInsets.fromLTRB(0, 16, 0, 32),
           itemCount: msgs.length,
           itemBuilder: (_, i) {
-            final origIdx   = widget.messages.length - 1 - i;
+            final origIdx   = _localMessages.length - 1 - i;
             final msg       = msgs[i];
             final msgTime   = msg['time']?.toString() ?? '';
             final msgStatus = _reportStatus[msgTime];
@@ -5648,15 +5803,14 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF888888).withOpacity(.1),
+                          color: const Color(0xFF555555),
                           borderRadius: BorderRadius.circular(20),
-                          border: Border.all(color: const Color(0xFF888888).withOpacity(.3)),
                         ),
                         child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                          Icon(Icons.hourglass_top_rounded, size: 12, color: Color(0xFF888888)),
+                          Icon(Icons.hourglass_top_rounded, size: 12, color: Colors.white),
                           SizedBox(width: 5),
                           Text('Verification in Progress',
-                              style: TextStyle(fontSize: 11, color: Color(0xFF888888), fontWeight: FontWeight.w600)),
+                              style: TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600)),
                         ]),
                       )
                     else
@@ -5775,10 +5929,37 @@ class _ScanBottomSheetState extends State<_ScanBottomSheet> {
   static const _apiUrl = 'https://joaquinkriztel-phishsense-backend.hf.space/predict';
 
   Future<void> _scan() async {
-    final sender = _senderCtrl.text.trim();
-    final text   = _messageCtrl.text.trim();
+    final sender     = _senderCtrl.text.trim();
+    final text       = _messageCtrl.text.trim();
     if (text.isEmpty) return;
     setState(() { _scanning = true; _error = null; });
+
+    final normalized = PhishingDetector.normalizeOtp(text);
+
+    // Check if this OTP template was already classified.
+    final p        = await SharedPreferences.getInstance();
+    final cacheRaw = p.getString('otp_template_cache');
+    final cache    = cacheRaw != null
+        ? (jsonDecode(cacheRaw) as Map<String, dynamic>)
+        : <String, dynamic>{};
+    final hit = cache[normalized];
+
+    if (hit != null) {
+      final label      = (hit['label'] as String? ?? 'Unknown');
+      final confidence = (hit['confidence'] as num?)?.toDouble() ?? 0.0;
+      final result = <String, dynamic>{
+        'sender'    : sender.isEmpty ? 'Unknown' : sender,
+        'message'   : text,
+        'label'     : label[0].toUpperCase() + label.substring(1),
+        'confidence': double.parse(confidence.toStringAsFixed(1)),
+        'time'      : DateTime.now().toIso8601String(),
+        'source'    : 'manual',
+      };
+      widget.onResult(result);
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+
     try {
       final res = await http.post(Uri.parse(_apiUrl),
           headers: {'Content-Type': 'application/json'},
@@ -5794,6 +5975,14 @@ class _ScanBottomSheetState extends State<_ScanBottomSheet> {
           final v = (data[key] ?? '').toString().trim();
           if (v.isNotEmpty && v.toLowerCase() != 'unknown') { sublabel = v; break; }
         }
+        // Save to template cache so future OTPs from the same sender skip the API.
+        cache[normalized] = {'label': label, 'confidence': conf};
+        if (cache.length > 500) {
+          final stale = cache.keys.take(cache.length - 400).toList();
+          for (final k in stale) cache.remove(k);
+        }
+        await p.setString('otp_template_cache', jsonEncode(cache));
+
         final result = <String, dynamic>{
           'sender'    : sender.isEmpty ? 'Unknown' : sender,
           'message'   : text,

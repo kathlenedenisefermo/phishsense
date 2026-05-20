@@ -138,24 +138,7 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
     return StreamBuilder<_MergedDocs>(
       stream: _mergedController.stream,
       builder: (context, snap) {
-        if (!snap.hasData) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.all(32),
-              child: Text(
-                'No reports yet.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Color(0xFF888888), fontSize: 15, height: 1.6),
-              ),
-            ),
-          );
-        }
-
         const reviewedStatuses = {'trained', 'verified', 'validated', 'rejected'};
-        final allDocs = <QueryDocumentSnapshot>[
-          ...snap.data!.active,
-          ...snap.data!.reviewed,
-        ];
 
         List<QueryDocumentSnapshot> sortByDate(List<QueryDocumentSnapshot> docs) =>
             docs..sort((a, b) {
@@ -167,6 +150,13 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
               return bT.compareTo(aT);
             });
 
+        final allDocs = snap.hasData
+            ? <QueryDocumentSnapshot>[
+                ...snap.data!.active,
+                ...snap.data!.reviewed,
+              ]
+            : <QueryDocumentSnapshot>[];
+
         final pendingDocs = sortByDate(allDocs.where((d) {
           final s = (d.data() as Map<String, dynamic>)['status'] as String? ?? '';
           return !reviewedStatuses.contains(s);
@@ -176,17 +166,51 @@ class _ReportTrackerBodyState extends State<ReportTrackerBody> {
           return reviewedStatuses.contains(s);
         }).toList());
 
-        if (pendingDocs.isEmpty && decidedDocs.isEmpty) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.all(32),
-              child: Text(
-                'No reports submitted yet.\n\nReport a message to track its review status here.',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                    color: Color(0xFF888888), fontSize: 15, height: 1.6),
+        final isEmpty = pendingDocs.isEmpty && decidedDocs.isEmpty;
+
+        if (isEmpty) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.showHeader)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                  child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('Report Tracker',
+                          style: TextStyle(fontSize: 26, fontWeight: FontWeight.w500)),
+                      Text('No reports yet',
+                          style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
+                    ]),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: const Color(0xFFAAAAAA), width: 1.5),
+                        borderRadius: BorderRadius.circular(30),
+                      ),
+                      child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.visibility_off_outlined, size: 15, color: Color(0xFFAAAAAA)),
+                        SizedBox(width: 5),
+                        Text('Hide reviewed',
+                            style: TextStyle(fontSize: 13, color: Color(0xFFAAAAAA), fontWeight: FontWeight.w600)),
+                      ]),
+                    ),
+                  ]),
+                ),
+              const Expanded(
+                child: Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(32),
+                    child: Text(
+                      'No reports submitted yet.\n\nReport a message to track its review status here.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Color(0xFF888888), fontSize: 15, height: 1.6),
+                    ),
+                  ),
+                ),
               ),
-            ),
+            ],
           );
         }
 

@@ -6,7 +6,6 @@ import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'profile.dart';
@@ -1153,12 +1152,13 @@ class _ConversationPageState extends State<_ConversationPage> {
         }
       }
 
-      // Remove any messageIds that no longer exist in Firestore (deleted)
+      // Remove any messageIds that no longer exist in Firestore (deleted without review)
       final deletedKeys = _reportStatus.keys
-          .where((k) => !activeMessageIds.contains(k) && _reportStatus[k] != 'pending')
+          .where((k) => !activeMessageIds.contains(k))
           .toList();
       for (final key in deletedKeys) {
         _reportStatus.remove(key);
+        _correctedLabel.remove(key); // revert any corrected label too
         changed = true;
       }
 
@@ -4618,9 +4618,9 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
         }
       }
 
-      // Remove deleted reports
+      // Remove deleted reports (deleted without review — revert to original label)
       final deletedKeys = _reportStatus.keys
-          .where((k) => !activeMessageIds.contains(k) && _reportStatus[k] != 'pending')
+          .where((k) => !activeMessageIds.contains(k))
           .toList();
       for (final key in deletedKeys) {
         _reportStatus.remove(key);
@@ -5926,79 +5926,29 @@ class _ScanBottomSheetState extends State<_ScanBottomSheet> {
   final _messageCtrl = TextEditingController();
   bool    _scanning = false;
   String? _error;
-  static const _apiUrl = 'https://joaquinkriztel-phishsense-backend.hf.space/predict';
 
   Future<void> _scan() async {
-    final sender     = _senderCtrl.text.trim();
-    final text       = _messageCtrl.text.trim();
+    final sender = _senderCtrl.text.trim();
+    final text   = _messageCtrl.text.trim();
     if (text.isEmpty) return;
     setState(() { _scanning = true; _error = null; });
 
-    final normalized = PhishingDetector.normalizeOtp(text);
-
-    // Check if this OTP template was already classified.
-    final p        = await SharedPreferences.getInstance();
-    final cacheRaw = p.getString('otp_template_cache');
-    final cache    = cacheRaw != null
-        ? (jsonDecode(cacheRaw) as Map<String, dynamic>)
-        : <String, dynamic>{};
-    final hit = cache[normalized];
-
-    if (hit != null) {
-      final label      = (hit['label'] as String? ?? 'Unknown');
-      final confidence = (hit['confidence'] as num?)?.toDouble() ?? 0.0;
+    try {
+      final detection = await PhishingDetector.classify(text);
+      final label = detection.label;
+      final conf  = detection.confidence * 100;
       final result = <String, dynamic>{
         'sender'    : sender.isEmpty ? 'Unknown' : sender,
         'message'   : text,
         'label'     : label[0].toUpperCase() + label.substring(1),
-        'confidence': double.parse(confidence.toStringAsFixed(1)),
+        'confidence': double.parse(conf.toStringAsFixed(1)),
         'time'      : DateTime.now().toIso8601String(),
         'source'    : 'manual',
       };
       widget.onResult(result);
       if (mounted) Navigator.of(context).pop();
-      return;
-    }
-
-    try {
-      final res = await http.post(Uri.parse(_apiUrl),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'message': text})).timeout(const Duration(seconds: 15));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        debugPrint('PhishSense API response: $data');
-        final label   = (data['label'] ?? 'Unknown').toString();
-        final rawConf = data['confidence'] ?? 0.0;
-        final conf    = (rawConf is num) ? rawConf.toDouble() * (rawConf <= 1.0 ? 100 : 1) : 0.0;
-        String sublabel = '';
-        for (final key in ['sublabel', 'sub_label', 'type', 'category', 'subtype', 'phishing_type', 'attack_type']) {
-          final v = (data[key] ?? '').toString().trim();
-          if (v.isNotEmpty && v.toLowerCase() != 'unknown') { sublabel = v; break; }
-        }
-        // Save to template cache so future OTPs from the same sender skip the API.
-        cache[normalized] = {'label': label, 'confidence': conf};
-        if (cache.length > 500) {
-          final stale = cache.keys.take(cache.length - 400).toList();
-          for (final k in stale) cache.remove(k);
-        }
-        await p.setString('otp_template_cache', jsonEncode(cache));
-
-        final result = <String, dynamic>{
-          'sender'    : sender.isEmpty ? 'Unknown' : sender,
-          'message'   : text,
-          'label'     : label[0].toUpperCase() + label.substring(1),
-          'confidence': double.parse(conf.toStringAsFixed(1)),
-          'time'      : DateTime.now().toIso8601String(),
-          'source'    : 'manual',
-        };
-        if (sublabel.isNotEmpty) result['sublabel'] = sublabel[0].toUpperCase() + sublabel.substring(1);
-        widget.onResult(result);
-        if (mounted) Navigator.of(context).pop();
-      } else {
-        setState(() { _error = 'Server error (${res.statusCode}).'; _scanning = false; });
-      }
     } catch (_) {
-      setState(() { _error = 'Could not reach the server. Check your connection.'; _scanning = false; });
+      setState(() { _error = 'Scan failed. Please try again.'; _scanning = false; });
     }
   }
 

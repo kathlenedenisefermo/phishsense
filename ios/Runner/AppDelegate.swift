@@ -38,29 +38,6 @@ import Foundation
               }
             }
             result("[]")
-          } else if call.method == "scanMessage" {
-            guard let args = call.arguments as? [String: Any],
-                  let message = args["message"] as? String else {
-              result(FlutterError(code: "BAD_ARGS", message: "Missing message", details: nil))
-              return
-            }
-            guard let url = URL(string: "https://phishsense-backend-production.up.railway.app/predict") else {
-              result(FlutterError(code: "BAD_URL", message: "Invalid URL", details: nil))
-              return
-            }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 30
-            request.httpBody = try? JSONSerialization.data(withJSONObject: ["message": message])
-            URLSession.shared.dataTask(with: request) { data, _, error in
-              if let data = data,
-                 let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                result(json)
-              } else {
-                result(FlutterError(code: "API_ERROR", message: error?.localizedDescription ?? "Unknown", details: nil))
-              }
-            }.resume()
           } else {
             result(FlutterMethodNotImplemented)
           }

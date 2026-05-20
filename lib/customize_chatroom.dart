@@ -639,7 +639,7 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
       InkWell(
         onTap: _pickFromGallery,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
           child: Row(children: [
             Container(
               width: 58,
@@ -647,10 +647,23 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
               decoration: BoxDecoration(
                 color: const Color(0xFFF0EDE6),
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFDDD8CE)),
+                border: Border.all(
+                  color: _isGalleryWallpaper
+                      ? _currentThemeColor
+                      : const Color(0xFFDDD8CE),
+                  width: _isGalleryWallpaper ? 2.5 : 1,
+                ),
               ),
-              child: const Icon(Icons.add_photo_alternate_outlined,
-                  color: Color(0xFF888888), size: 26),
+              child: _isGalleryWallpaper
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: Image.file(
+                        File(_galleryFilePath!),
+                        fit: BoxFit.cover,
+                      ),
+                    )
+                  : const Icon(Icons.add_photo_alternate_outlined,
+                      color: Color(0xFF888888), size: 26),
             ),
             const SizedBox(width: 14),
             const Text('Import from Gallery',
@@ -659,6 +672,25 @@ class _CustomizeChatroomPageState extends State<CustomizeChatroomPage> {
           ]),
         ),
       ),
+
+      // Remove Image — shown only when a gallery image is active
+      if (_isGalleryWallpaper)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: GestureDetector(
+            onTap: () => setState(() => _selectedWallpaper = 'background'),
+            child: const Text(
+              'Remove Image',
+              style: TextStyle(
+                fontSize: 13,
+                color: Color(0xFFE53935),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        )
+      else
+        const SizedBox(height: 12),
 
       // Image designs
       const Padding(

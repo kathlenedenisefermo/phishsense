@@ -25,11 +25,12 @@ class IOSMessagesPage extends StatefulWidget {
 }
 
 class _IOSMessagesPageState extends State<IOSMessagesPage> {
-  static const _channel        = MethodChannel('com.phishsense/appgroup');
-  static const _manualKey      = 'manual_scan_logs';
-  static const _spamKey        = 'spam_folder_logs';
-  static const _spamEnabledKey = 'spam_folder_enabled';
-  static const _deviceIdKey    = 'phishsense_device_id';
+  static const _channel          = MethodChannel('com.phishsense/appgroup');
+  static const _manualKey        = 'manual_scan_logs';
+  static const _spamKey          = 'spam_folder_logs';
+  static const _spamEnabledKey   = 'spam_folder_enabled';
+  static const _deviceIdKey      = 'phishsense_device_id';
+  static const _deletedTimesKey  = 'deleted_message_times';
 
   List<Map<String, dynamic>> _allMessages     = [];
   List<Map<String, dynamic>> _threads         = [];
@@ -198,23 +199,50 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
     final p = await SharedPreferences.getInstance();
     await p.setBool(_spamEnabledKey, v);
     if (v) {
+      // Move phishing messages from inbox to spam
       final man    = await _getManualScans();
       final toSpam = man.where((m) => (m['label'] ?? '').toString().toLowerCase() == 'phishing').toList();
       for (final m in toSpam) await saveSpamMessage(m);
       final remaining = man.where((m) => (m['label'] ?? '').toString().toLowerCase() != 'phishing').toList();
       await p.setString(_manualKey, jsonEncode(remaining));
-    } else {
-      final spam = await getSpamMessages();
-      final man  = await _getManualScans();
-      man.insertAll(0, spam);
-      if (man.length > 200) man.removeRange(200, man.length);
-      await p.setString(_manualKey, jsonEncode(man));
-      await p.setString(_spamKey, jsonEncode([]));
     }
+    // When turning OFF we leave spamKey untouched — _loadMessages skips the
+    // spamTimes filter when spam is disabled, so the messages remain visible in
+    // the inbox without any risky data movement.
+
+    // Sync Firestore report source fields so reports follow their messages
+    await _syncReportSources(spamEnabled: v);
+
     if (mounted) {
       setState(() => _spamEnabled = v);
       if (_scaffoldKey.currentState?.isEndDrawerOpen == true) Navigator.of(context).pop();
       await _loadMessages();
+    }
+  }
+
+  /// Updates the `source` field on Firestore report documents so they appear
+  /// in the correct tab (inbox vs spam) after a spam-folder toggle.
+  Future<void> _syncReportSources({required bool spamEnabled}) async {
+    if (_deviceId.isEmpty) return;
+    try {
+      final spamMsgs  = await getSpamMessages();
+      if (spamMsgs.isEmpty) return;
+      final spamTimes = spamMsgs.map((m) => m['time']?.toString() ?? '').toSet();
+      final newSource = spamEnabled ? 'spam' : 'inbox';
+      final snap = await FirebaseFirestore.instance
+          .collection('model_feedback')
+          .where('deviceId', isEqualTo: _deviceId)
+          .get();
+      for (final doc in snap.docs) {
+        final data   = doc.data() as Map<String, dynamic>;
+        final msgTime = (data['messageId'] ?? data['messageTime'] ?? '').toString();
+        final curSrc  = (data['source'] ?? 'inbox').toString();
+        if (spamTimes.contains(msgTime) && curSrc != newSource) {
+          await doc.reference.update({'source': newSource});
+        }
+      }
+    } catch (e) {
+      debugPrint('[syncReportSources] $e');
     }
   }
 
@@ -317,6 +345,24 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
     }
   }
 
+  static Future<Set<String>> _getDeletedTimes() async {
+    final p   = await SharedPreferences.getInstance();
+    final raw = p.getString(_deletedTimesKey);
+    if (raw == null || raw.isEmpty) return {};
+    return (jsonDecode(raw) as List).cast<String>().toSet();
+  }
+
+  static Future<void> _recordDeletedTimes(Iterable<String> times) async {
+    final p        = await SharedPreferences.getInstance();
+    final existing = await _getDeletedTimes();
+    existing.addAll(times.where((t) => t.isNotEmpty));
+    // Cap to avoid unbounded growth
+    final capped = existing.length > 2000
+        ? existing.skip(existing.length - 2000).toSet()
+        : existing;
+    await p.setString(_deletedTimesKey, jsonEncode(capped.toList()));
+  }
+
   Future<void> _loadMessages() async {
     List<Map<String, dynamic>> ext = [], man = [];
     if (!kIsWeb) {
@@ -326,9 +372,17 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
       } catch (_) {}
     }
     try { man = await _getManualScans(); } catch (_) {}
-    final spamTimes = (await getSpamMessages()).map((m) => m['time']?.toString() ?? '').toSet();
-    final all = [...ext, ...man]
-        .where((m) => !spamTimes.contains(m['time']?.toString() ?? ''))
+    final spamMsgs    = await getSpamMessages();
+    final spamTimes   = _spamEnabled
+        ? spamMsgs.map((m) => m['time']?.toString() ?? '').toSet()
+        : <String>{};
+    final deletedTimes = await _getDeletedTimes();
+    // When spam is disabled, include spam-folder messages in the inbox list
+    final all = [...ext, ...man, if (!_spamEnabled) ...spamMsgs]
+        .where((m) {
+          final t = m['time']?.toString() ?? '';
+          return !spamTimes.contains(t) && !deletedTimes.contains(t);
+        })
         .toList()
       ..sort((a, b) {
         final ta = DateTime.tryParse(a['time'] ?? '') ?? DateTime(0);
@@ -365,8 +419,10 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
   }
 
   Future<void> _deleteThread(String sender) async {
-    final updated = _allMessages.where((m) => (m['sender'] ?? '').toString() != sender).toList();
+    final toDelete = _allMessages.where((m) => (m['sender'] ?? '').toString() == sender).toList();
+    final updated  = _allMessages.where((m) => (m['sender'] ?? '').toString() != sender).toList();
     setState(() { _allMessages = updated; _threads = _buildThreads(updated); _filteredThreads = _applySearch(_threads); });
+    await _recordDeletedTimes(toDelete.map((m) => m['time']?.toString() ?? ''));
     await _persistManualScans(updated);
   }
 
@@ -589,6 +645,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
               _threads         = _buildThreads(updated);
               _filteredThreads = _applySearch(_threads);
             });
+            await _recordDeletedTimes(times);
             await _persistManualScans(updated);
           },
         ),
@@ -746,6 +803,7 @@ class _IOSMessagesPageState extends State<IOSMessagesPage> {
                               _threads         = _buildThreads(updated);
                               _filteredThreads = _applySearch(_threads);
                             });
+                            await _recordDeletedTimes(times);
                             await _persistManualScans(updated);
                           },
                           ))).then((_) => _loadMessages()),
@@ -2406,7 +2464,7 @@ class _ConversationPageState extends State<_ConversationPage> {
           constraints: BoxConstraints(maxWidth: MediaQuery.of(ctx).size.width * 0.82),
           decoration: BoxDecoration(
             color: isSelected
-                ? const Color(0xFFD0EAE6)
+                ? (displayPhishing ? const Color(0xFFFFB3B3) : const Color(0xFFD0EAE6))
                 : (displayPhishing ? const Color(0xFFFFCDD2) : const Color(0xFFD6F0E8)),
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(4),
@@ -2415,7 +2473,7 @@ class _ConversationPageState extends State<_ConversationPage> {
               bottomRight: Radius.circular(18),
             ),
             border: isSelected
-                ? Border.all(color: const Color(0xFF1A7A72), width: 1.5)
+                ? Border.all(color: displayPhishing ? const Color(0xFFF2554F) : const Color(0xFF1A7A72), width: 1.5)
                 : isSearchMatch
                 ? Border.all(color: const Color(0xFFFFE57F), width: 1.5)
                 : null,
@@ -2911,11 +2969,11 @@ class _ConversationPageState extends State<_ConversationPage> {
                               decoration: BoxDecoration(
                                 shape: BoxShape.circle,
                                 color: isSelected
-                                    ? const Color(0xFF1A7A72)
+                                    ? (displayPhishing ? const Color(0xFFF2554F) : const Color(0xFF1A7A72))
                                     : Colors.white,
                                 border: Border.all(
                                   color: isSelected
-                                      ? const Color(0xFF1A7A72)
+                                      ? (displayPhishing ? const Color(0xFFF2554F) : const Color(0xFF1A7A72))
                                       : const Color(0xFFCCCCCC),
                                   width: 2,
                                 ),
@@ -3399,6 +3457,28 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
 
   String get _autoDeletionLabel =>
       _autoDeletionDays == null ? 'Never' : '$_autoDeletionDays days';
+
+  Future<void> _restoreMessageToInbox(String msgTime) async {
+    final idx = _spamMessages.indexWhere((m) => m['time']?.toString() == msgTime);
+    if (idx == -1) return;
+    final msg     = _spamMessages[idx];
+    final updated = List<Map<String, dynamic>>.from(_spamMessages)..removeAt(idx);
+    await _persistSpam(updated);
+    final p   = await SharedPreferences.getInstance();
+    final raw = p.getString(_manualKey);
+    final man = raw != null && raw.isNotEmpty
+        ? (jsonDecode(raw) as List).cast<Map<String, dynamic>>()
+        : <Map<String, dynamic>>[];
+    if (!man.any((m) => m['time']?.toString() == msgTime)) {
+      man.insert(0, msg);
+      if (man.length > 200) man.removeRange(200, man.length);
+      await p.setString(_manualKey, jsonEncode(man));
+    }
+    setState(() {
+      _spamMessages = updated;
+      _threads      = _buildThreads(updated);
+    });
+  }
 
   Future<void> _restoreToInbox(String sender) async {
     final toRestore = _spamMessages.where((m) => (m['sender'] ?? '') == sender).toList();
@@ -4042,7 +4122,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                     threads: _threads,
                     formatTime: widget.formatTime,
                     deviceId: widget.deviceId,
-                    onRestore: _restoreToInbox,
+                    onRestoreMessage: _restoreMessageToInbox,
                     onDelete: _deleteFromSpam,
                     onConfirmDelete: _confirmDelete,
                     onDeleteMessage: _deleteMessageFromSpam,
@@ -4126,7 +4206,6 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                       final count  = thread['count'] as int;
                       final time   = widget.formatTime(latest['time'] as String?);
                       return InkWell(
-                          onLongPress: () => _showSpamOptions(ctx, sender),
                           onTap: () => Navigator.push(
                               context,
                               MaterialPageRoute(
@@ -4134,7 +4213,7 @@ class _SpamFolderPageState extends State<SpamFolderPage> {
                                     messages: thread['messages'] as List<Map<String, dynamic>>,
                                     sender: sender,
                                     formatTime: widget.formatTime,
-                                    onRestore: () => _restoreToInbox(sender),
+                                    onRestoreMessage: _restoreMessageToInbox,
                                     onDelete: () => _deleteFromSpam(sender),
                                     onConfirmDelete: () => _confirmDelete(sender),
                                     onDeleteMessage: _deleteMessageFromSpam,
@@ -4396,7 +4475,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
   final List<Map<String, dynamic>> threads;
   final String Function(String?) formatTime;
   final String deviceId;
-  final Future<void> Function(String) onRestore;
+  final Future<void> Function(String msgTime) onRestoreMessage;
   final Future<void> Function(String) onDelete;
   final Future<bool> Function(String) onConfirmDelete;
   final Future<void> Function(String) onDeleteMessage;
@@ -4406,7 +4485,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
     required this.threads,
     required this.formatTime,
     required this.deviceId,
-    required this.onRestore,
+    required this.onRestoreMessage,
     required this.onDelete,
     required this.onConfirmDelete,
     required this.onDeleteMessage,
@@ -4495,7 +4574,7 @@ class _SpamSearchDelegate extends SearchDelegate<String> {
                   messages: thread['messages'] as List<Map<String, dynamic>>,
                   sender: sender,
                   formatTime: formatTime,
-                  onRestore: () => onRestore(sender),
+                  onRestoreMessage: onRestoreMessage,
                   onDelete: () => onDelete(sender),
                   onConfirmDelete: () => onConfirmDelete(sender),
                   onDeleteMessage: onDeleteMessage,
@@ -4520,7 +4599,7 @@ class _SpamConversationPage extends StatefulWidget {
   final List<Map<String, dynamic>> messages;
   final String sender;
   final String Function(String?) formatTime;
-  final VoidCallback onRestore;
+  final void Function(String msgTime) onRestoreMessage;
   final VoidCallback onDelete;
   final Future<bool> Function() onConfirmDelete;
   final Future<void> Function(String time) onDeleteMessage;
@@ -4531,7 +4610,7 @@ class _SpamConversationPage extends StatefulWidget {
     required this.messages,
     required this.sender,
     required this.formatTime,
-    required this.onRestore,
+    required this.onRestoreMessage,
     required this.onDelete,
     required this.onConfirmDelete,
     required this.onDeleteMessage,
@@ -4893,7 +4972,7 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
             child: OutlinedButton.icon(
               onPressed: () {
                 Navigator.pop(ctx);
-                widget.onRestore();
+                widget.onRestoreMessage(msgTime);
                 if (mounted) Navigator.pop(context);
               },
               icon: const Icon(Icons.move_to_inbox_outlined,
@@ -5261,30 +5340,6 @@ class _SpamConversationPageState extends State<_SpamConversationPage> {
     )));
   }
 
-  void _showThreeDotMenu(BuildContext ctx) {
-    showMenu(
-      context: ctx,
-      position: const RelativeRect.fromLTRB(1000, 56, 8, 0),
-      color: Colors.white,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      items: [
-        _menuItem(Icons.search, 'Search messages', () { setState(() => _searchActive = true); }),
-        _menuItem(Icons.move_to_inbox_outlined, 'Move to Inbox', () { widget.onRestore(); if (mounted) Navigator.pop(context); }),
-        _menuItem(Icons.delete_outline, 'Delete conversation', () async {
-          if (await widget.onConfirmDelete()) { widget.onDelete(); if (mounted) Navigator.pop(context); }
-        }),
-        _menuItem(Icons.notifications_off_outlined, 'Mute notifications', () {}),
-      ],
-    );
-  }
-
-  PopupMenuItem _menuItem(IconData icon, String label, VoidCallback onTap) {
-    return PopupMenuItem(onTap: onTap, child: Row(children: [
-      Icon(icon, size: 20, color: const Color(0xFF444444)),
-      const SizedBox(width: 12),
-      Text(label, style: const TextStyle(fontSize: 15)),
-    ]));
-  }
 
   List<Map<String, dynamic>> _extractLabelDetails(Map<String, dynamic> msg) {
     for (final key in ['sublabel', 'sub_label', 'type', 'category', 'subtype', 'phishing_type', 'attack_type']) {
